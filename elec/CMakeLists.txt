@@ -113,7 +113,11 @@ set (reaction_src
 	#TT06Tau.cc
 	#TT06Func.cc
         BetterTT06.cc
-        #Grandi.cc
+        BetterTT06_gNa.cc
+        BetterTT06_gNa_gCaL.cc
+        BetterTT06_gNa_gCaL_malignantVA.cc
+        BetterTT06_gNa_gCaL_malignantVA_gto.cc
+        Grandi.cc
 	#pade.cc
 )
 

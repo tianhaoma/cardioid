@@ -305,6 +305,13 @@ int main(int argc, char *argv[])
    mesh->SetAttributes();
    EndTimer();
 
+   const char omesh_file[] = "mesh-after-read.vtk";
+   ofstream omesh(omesh_file);
+   omesh.precision(14);
+   mesh->PrintVTK(omesh);
+   cout << "New VTK mesh file: " << omesh_file << endl;
+
+
    StartTimer("Partition Mesh");
    // If I read correctly, pmeshpart will now point to an integer array
    //  containing a partition ID (rank!) for every element ID.
@@ -389,9 +396,24 @@ int main(int argc, char *argv[])
 
             int ielem = element_from_globalvert[globalvert];
             material_from_ranklookup[ranklookup] = mesh->GetElement(ielem)->GetAttribute();
+
+            //std::cout << "material_from_ranklookup :"<<ranklookup<<":" << material_from_ranklookup[ranklookup] << std::endl;
+            
          }
       }
    }
+
+for (int ielem=0; ielem<mesh->GetNE(); ielem++)
+      {
+   mesh->SetAttribute(ielem, 1);
+            //std::cout << "New attr :" << mesh->GetElement(ielem)->GetAttribute() << std::endl;
+      }
+
+   const char omesh_file_[] = "mesh-after-setAttr.vtk";
+   ofstream omesh_(omesh_file_);
+   omesh_.precision(14);
+   mesh->PrintVTK(omesh_);
+   cout << "New VTK mesh file: " << omesh_file_ << endl;
    
    if (my_rank == 0)
    {
@@ -400,6 +422,13 @@ int main(int argc, char *argv[])
       }
    }
    ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, *mesh, pmeshpart);
+
+   const char omesh_file_p[] = "pmesh-after-p.vtk";
+   ofstream omesh_p(omesh_file_p);
+   omesh_p.precision(14);
+   pmesh->PrintVTK(omesh_p);
+   cout << "New VTK pmesh file: " << omesh_file_p << endl;
+
    
    // Build a new FEC...
    FiniteElementCollection *fec;
@@ -434,10 +463,20 @@ int main(int argc, char *argv[])
    std::shared_ptr<ParGridFunction> fiber_quat;
    fiber_quat = std::make_shared<mfem::ParGridFunction>(pmesh, flat_fiber_quat.get(), pmeshpart);
 
+   std::shared_ptr<GridFunction> flat_sheet_quat;
+   ecg_readGF(obj, "sheet", mesh, flat_sheet_quat);
+   std::shared_ptr<ParGridFunction> sheet_quat;
+   sheet_quat = std::make_shared<mfem::ParGridFunction>(pmesh, flat_sheet_quat.get(), pmeshpart);
+
+   std::shared_ptr<GridFunction> flat_transverse_quat;
+   ecg_readGF(obj, "transverse", mesh, flat_transverse_quat);
+   std::shared_ptr<ParGridFunction> transverse_quat;
+   transverse_quat = std::make_shared<mfem::ParGridFunction>(pmesh, flat_transverse_quat.get(), pmeshpart);
+
    
    // Load conductivity data
-   MatrixElementPiecewiseCoefficient sigma_m_pos_coeffs(fiber_quat);
-   MatrixElementPiecewiseCoefficient sigma_m_neg_coeffs(fiber_quat);
+   MatrixElementPiecewiseCoefficient sigma_m_pos_coeffs(fiber_quat, sheet_quat, transverse_quat);
+   MatrixElementPiecewiseCoefficient sigma_m_neg_coeffs(fiber_quat, sheet_quat, transverse_quat);
    for (int ii=0; ii<heartRegions.size(); ii++) {
       int heartCursor=3*ii;
       Vector sigma_m_vec(&sigma_m[heartCursor],3);
@@ -503,7 +542,13 @@ int main(int argc, char *argv[])
    ThreadServer& threadServer = ThreadServer::getInstance();
    ThreadTeam defaultGroup = threadServer.getThreadTeam(vector<unsigned>());
    std::vector<std::string> reactionNames;
-   reactionNames.push_back(reactionName);
+
+   objectGet(obj,"reaction", reactionNames);
+   
+   //reactionNames.push_back(reactionName);
+   std::vector<int> material;
+   //material = readMaterial(obj, "material");
+   //reactionNames.push_back(reactionName);
    std::vector<int> cellTypes;
 
    //int Iion_order = 2*order+3;
@@ -514,7 +559,13 @@ int main(int argc, char *argv[])
       for (int ranklookup=local_extents[my_rank]; ranklookup<local_extents[my_rank+1]; ranklookup++)
       {
          cellTypes.push_back(material_from_ranklookup[ranklookup]);
+         //cellTypes.push_back(material[globalvert_from_ranklookup[ranklookup]]);
       }
+      //for(auto i: cellTypes)
+      {
+         std::cout<< "myrank:"<< my_rank<< "," << cellTypes.size() << std::endl;
+      }
+      
    }
    else
    {

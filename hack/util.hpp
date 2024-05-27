@@ -9,6 +9,8 @@
 #include "object_cc.hh"
 #include "pioFixedRecordHelper.h"
 
+std::vector<int> readMaterial(OBJECT* obj, const std::string dataname);//mth
+std::vector<int> readMaterialArray(std::istream& stream);//mth
 std::set<int> readSet(std::istream& stream);
 std::set<int> ecg_readSet(OBJECT* obj, const std::string dataname);
 std::unordered_map<int,int> readMap(std::istream& stream);

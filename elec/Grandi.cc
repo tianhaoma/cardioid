@@ -1963,15 +1963,38 @@ ThisReaction::ThisReaction(const int numPoints, const double __dt)
 ThisReaction::~ThisReaction() {}
 
 void ThisReaction::calc(double _dt,
+                ro_mgarray_ptr<int> ___indexArray,
                 ro_mgarray_ptr<double> ___Vm,
                 ro_mgarray_ptr<double> ___iStim,
                 wo_mgarray_ptr<double> ___dVm)
 {
+   //indexArray from BetterTT06.cc
+   ro_array_ptr<int>    __indexArray = ___indexArray.useOn(CPU);
+
    ro_array_ptr<double> __Vm = ___Vm.useOn(CPU);
    ro_array_ptr<double> __iStim = ___iStim.useOn(CPU);
    wo_array_ptr<double> __dVm = ___dVm.useOn(CPU);
 
    //define the constants
+double ISO = 0.0;
+double nu = 0.34999999999999998;
+double AF = 0.0;
+double RA = 0.0;
+double f_conducting = 1.0;//have not implemented this parameter yet!!
+double fcaCaMSL = 0.0;
+double fcaCaj = 0.0;
+double pCa_max = 0.00027;
+double pK_max = 1.35e-7;
+double pNa_max = 7.4999999999999993e-9;
+double pK1_max = 0.0525;
+double gKr_max = 0.035;//double check
+double gKs_max, gKur_max, gNa_max, gNaL_max;//double check
+double IbarNCX_max = 3.15;
+double gto_max ;//= GtoFast;
+
+
+
+
    double R = 8314.0;
    double Frdy = 96485.0;
    double Temp = 310.0;
@@ -2036,7 +2059,8 @@ void ThisReaction::calc(double _dt,
    double ksat = 0.27000000000000002;
    double Kdact = 0.00038400000000000001;
    double Q10NCX = 1.5700000000000001;
-   double IbarNCX = 1.26*AF + 3.1499999999999999;
+   //double IbarNCX = 1.26*AF + 3.1499999999999999;//different equation!!
+   double IbarNCX = (1.00000+ 0.400000*AF)*IbarNCX_max;
    double _expensive_functions_064 = pow(Q10NCX, Qpow);
    double _expensive_functions_066 = pow(Q10NCX, Qpow);
    double Q10SLCaP = 2.3500000000000001;
@@ -2049,7 +2073,7 @@ void ThisReaction::calc(double _dt,
    double GCaB = 0.00060643000000000003;
    double Q10SRCaP = 2.6000000000000001;
    double Vmax_SRCaP = -0.0026557*AF + 0.0053114;
-   double Kmf = -0.00030750000000000005*ISO + 0.0006150000000000001;
+   double Kmf = -0.00030750000000000005*ISO + 0.0006150000000000001;//different equation!!
    double Kmr = 1.7;
    double hillSRCaP = 1.7869999999999999;
    double ks = 25.0;
@@ -2101,12 +2125,48 @@ void ThisReaction::calc(double _dt,
    double KmCsqnb = koff_csqn/kon_csqn;
    double _expensive_functions_081 = exp(-_dt/tauhl);
    double _hL_RLA = _expensive_functions_081 - 1;
+
+
+
+//int odeTimeFactor = 10; //1 10 20 50 100
+//_dt = _dt/odeTimeFactor_;
+//double _dt_2 = _dt/2;
+
+
+
    for (unsigned __jj=0; __jj<(nCells_+width-1)/width; __jj++)
    {
       const int __ii = __jj*width;
-      //set Vm
+
+      /*
+      //set Vm (origin form Grandi)
       const real V = load(&__Vm[__ii]);
       const real iStim = load(&__iStim[__ii]);
+      */
+
+      //set Vm (from BetterTT06)
+      double __Vm_local[width];
+      {
+         int cursor = 0;
+         for (int __kk=0; __kk<width; __kk++)
+         {
+            __Vm_local[__kk] = __Vm[__indexArray[__ii+cursor]];
+            if (__ii+__kk < nCells_) { cursor++; }
+         }
+      }
+      const real V = load(&__Vm_local[0]);
+
+
+
+
+
+
+
+
+
+//for (int iii = 0; iii<odeTimeFactor_; iii++)     //_dt/odeTimeFactor
+{
+
 
       //set all state variables
       real CaM=load(state_[__jj].CaM);
@@ -2148,6 +2208,426 @@ void ThisReaction::calc(double _dt,
       real xtf=load(state_[__jj].xtf);
       real ykur=load(state_[__jj].ykur);
       real ytf=load(state_[__jj].ytf);
+
+      real Csqn=load(state_[__jj].Csqn);
+
+
+
+//Gating update (#gating = 13)
+
+//d
+real d_inf = 1.00000/(1.00000 + exp(- ((V + 3.00000*ISO)+9.00000)/6.00000));;
+real d_tau = ( d_inf*(1.00000 - exp(- ((V+ 3.00000*ISO)+9.00000)/6.00000)))/( 0.0350000*((V+ 3.00000*ISO)+9.00000));;
+
+//f
+real f_inf = 1.00000/(1.00000+exp(((V+ 3.00000*ISO)+30.0000)/7.00000))+0.200000/(1.00000+exp(((50.0000 - V) -  3.00000*ISO)/20.0000));
+real f_tau = 1.00000/( 0.0197000*exp(- pow( 0.0337000*((V+ 3.00000*ISO)+25.0000), 2.00000))+0.0200000);;
+
+//Xr(xkr)
+real xkr_inf = 1.00000/(1.00000+exp(- (V+10.0000)/5.00000));
+real xkr_tau = ( ((550.000)/(1.00000+exp((- 22.0000 - V)/9.00000)))*6.00000)/(1.00000+exp((V+11.0000)/9.00000))+230.000/(1.00000+exp((V+40.0000)/20.0000));;
+
+//Xs
+//eal Xs_inf = 1.00000/(1.00000+exp(- ((V+ 40.0000*ISO)+3.80000)/14.2500));
+//real Xs_tau = 990.100/(1.00000+exp(- ((V+ 40.0000*ISO)+2.43600)/14.1200));
+
+//xkur(ikur_r)
+real xkur_inf = 1.00000/(1.00000+exp((V+6.00000)/- 8.60000));
+real xkur_tau = 9.00000/(1.00000+exp((V+5.00000)/12.0000))+0.500000;
+
+//s
+//real s_inf = 1.00000/(1.00000+exp(- ((V+ 40.0000*ISO)+3.80000)/14.2500));
+//real s_tau = 990.100/(1.00000+exp(- ((V+ 40.0000*ISO)+2.43600)/14.1200));
+
+//h
+real h_a =  (V>=- 40.0000 ? 0.00000 :  0.0570000*exp(- (V+80.0000)/6.80000))*1.00000;
+real h_b =  (V>=- 40.0000 ? 0.770000/( 0.130000*(1.00000+exp(- (V+10.6600)/11.1000))) :  2.70000*exp( 0.0790000*V)+ ( 3.10000*pow(10.0000, 5.00000))*exp( 0.348500*V))*1.00000;
+real h_inf = 1.00000/pow(1.00000+exp((V+71.5500)/7.43000), 2.00000);
+real h_tau = 1.00000/(h_a+h_b);
+
+//j
+real j_a =  (V>=- 40.0000 ? 0.00000 :  (( ( ( - 2.54280*pow(10.0000, 4.00000))*exp( 0.244400*V) -  ( 6.94800*pow(10.0000, - 6.00000))*exp( - 0.0439100*V))*(V+37.7800))/(1.00000+exp( 0.311000*(V+79.2300))))*1.00000)*1.00000;
+real j_b =  (V>=- 40.0000 ? ( 0.600000*exp( 0.0570000*V))/(1.00000+exp( - 0.100000*(V+32.0000))) : ( 0.0242400*exp( - 0.0105200*V))/(1.00000+exp( - 0.137800*(V+40.1400))))*1.00000;
+real j_inf = 1.00000/pow(1.00000+exp((V+71.5500)/7.43000), 2.00000);;
+real j_tau = 1.00000/( j_a + j_b );
+
+//m
+real m_inf = 1.00000/pow(1.00000+exp(- (56.8600+V)/9.03000), 2.00000);
+real m_tau = 0.129200*exp(- pow((V+45.7900)/15.5400, 2.00000))+ 0.0648700*exp(- pow((V - 4.82300)/51.1200, 2.00000));
+
+
+//mL
+real mL_a = ( 0.320000*(V+47.1300))/(1.00000 - exp( - 0.100000*(V+47.1300)));
+real mL_b = 0.0800000*exp(- V/11.0000);
+
+
+//hL
+real hL_inf = 1.00000/(1.00000+exp((V+91.0000)/6.10000));
+real hL_tau = 600.0;
+
+//xtf (x) (ito)
+real xtf_inf = 1.00000/(1.00000+exp(- (V+1.00000)/11.0000));
+real xtf_tau = 3.50000*exp(- pow(V/30.0000, 2.00000))+1.50000;
+
+//ytf (y) (ito)
+real ytf_inf = 1.00000/(1.00000+exp((V+40.5000)/11.5000));
+real ytf_tau = 25.6350*exp(- pow((V+52.4500)/15.8827, 2.00000))+24.1400;
+
+
+//xks (xs)
+real xks_inf = 1.00000/(1.00000+exp(- ((V+ 40.0000*ISO)+3.80000)/14.2500));
+real xks_tau = 990.100/(1.00000+exp(- ((V+ 40.0000*ISO)+2.43600)/14.1200));
+
+//ykur (s)(ikur)
+real ykur_inf = 1.00000/(1.00000+exp((V+7.50000)/10.0000));
+real ykur_tau = 590.000/(1.00000+exp((V+60.0000)/10.0000))+3050.00;
+
+
+
+
+
+real d_diff = (d_inf - d)/d_tau;//
+real f_diff = (f_inf - f)/f_tau;//
+real h_diff = (h_inf - h)/h_tau;//
+real hL_diff = (hL_inf - hL)/hL_tau;//
+real j_diff = (j_inf - j)/j_tau;//
+real m_diff = (m_inf - m)/m_tau;//
+real mL_diff = mL_a*(1.00000 - mL) -  mL_b*mL;
+real xkr_diff = (xkr_inf - xkr)/xkr_tau;//
+real xks_diff = (xks_inf - xks)/xks_tau;
+real xkur_diff = (xkur_inf - xkur)/xkur_tau;//
+real xtf_diff = (xtf_inf - xtf)/xtf_tau;//
+real ykur_diff = (ykur_inf - ykur)/ykur_tau;
+real ytf_diff = (ytf_inf - ytf)/ytf_tau;//
+//real RyRi_diff = (RyRi_inf - RyRi)/RyRi_tau;
+//eal RyRo_diff = (RyRo_inf - RyRo)/RyRo_tau;
+//real RyRr_diff = (RyRr_inf - RyRr)/RyRr_tau;
+
+// #if 0
+d = d_inf + (d-d_inf)*exp(-_dt/d_tau);
+f = f_inf + (f-f_inf)*exp(-_dt/f_tau);
+h = h_inf + (h-h_inf)*exp(-_dt/h_tau);
+hL = hL_inf + (hL-hL_inf)*exp(-_dt/hL_tau);
+j = j_inf + (j-j_inf)*exp(-_dt/j_tau);
+m = m_inf + (m-m_inf)*exp(-_dt/m_tau);
+mL += _dt*mL_diff;             // FE method
+xkr = xkr_inf + (xkr-xkr_inf)*exp(-_dt/xkr_tau);
+xks = xks_inf + (xks-xks_inf)*exp(-_dt/xks_tau);
+xkur = xkur_inf + (xkur-xkur_inf)*exp(-_dt/xkur_tau);
+xtf = xtf_inf + (xtf-xtf_inf)*exp(-_dt/xtf_tau);
+ykur = ykur_inf + (ykur-ykur_inf)*exp(-_dt/ykur_tau);
+ytf = ytf_inf + (ytf-ytf_inf)*exp(-_dt/ytf_tau);
+// #endif
+
+#if 0
+std::cout << " d:  " << d << std::endl;
+std::cout << " f:  " << f << std::endl;
+std::cout << " h:  " << h << std::endl;
+std::cout << " hL:  " << hL << std::endl;
+std::cout << " j:  " << j << std::endl;
+std::cout << " m:  " << m << std::endl;
+std::cout << " mL:  " << mL << std::endl;
+std::cout << " xkr:  " << xkr << std::endl;
+std::cout << " xks:  " << xks << std::endl;
+std::cout << " xkur:  " << xkur << std::endl;
+std::cout << " xtf:  " << xtf << std::endl;
+std::cout << " ykur:  " << ykur << std::endl;
+std::cout << " ytf:  " << ytf << std::endl;
+#endif
+
+
+
+
+//current /get the other differential updates
+      real _expensive_functions = log(Nao/Naj);
+      real ENa_junc = 1.0*_expensive_functions/FoRT;
+      real _expensive_functions_001 = log(Nao/Nasl);
+      real ENa_sl = 1.0*_expensive_functions_001/FoRT;
+      real _expensive_functions_002 = log(Ko/Ki);
+      real EK = 1.0*_expensive_functions_002/FoRT;
+      real _expensive_functions_003 = log((Ko + Nao*pNaK)/(Ki + Nai*pNaK));
+      real EKs = 1.0*_expensive_functions_003/FoRT;
+      real _expensive_functions_004 = log(Cao/Caj);
+      real ECa_junc = 0.5*_expensive_functions_004/FoRT;
+      real _expensive_functions_005 = log(Cao/Casl);
+      real ECa_sl = 0.5*_expensive_functions_005/FoRT;
+      real vek = -EK + V;
+      real veks = -EKs + V;
+      real INa_junc = (m*m*m)*Fjunc*GNa*h*j*(-ENa_junc + V);
+      real INa_sl = (m*m*m)*Fsl*GNa*h*j*(-ENa_sl + V);
+      real INaL_junc = (mL*mL*mL)*Fjunc*GNaL*hL*(-ENa_junc + V);
+      real INaL_sl = (mL*mL*mL)*Fsl*GNaL*hL*(-ENa_sl + V);
+      real INaBk_junc = Fjunc*GNaB*(-ENa_junc + V);
+      real INaBk_sl = Fsl*GNaB*(-ENa_sl + V);
+
+      real _expensive_functions_015 = exp(0.01485884101040119*Nao);
+      real __sigma = 0.14285714285714285*_expensive_functions_015 - 0.14285714285714285;
+      real fnak = 1.00000/((1.00000+ 0.124500*exp( ( - 0.100000*V)*FoRT))+ ( 0.0365000*__sigma)*exp( - V*FoRT));
+      real INAK_junc = Fjunc*IbarNaK*Ko*fnak/((KmKo + Ko)*(((KmNaip/Naj)*(KmNaip/Naj)*(KmNaip/Naj)*(KmNaip/Naj)) + 1.0));
+      real INAK_sl = Fsl*IbarNaK*Ko*fnak/((KmKo + Ko)*(((KmNaip/Nasl)*(KmNaip/Nasl)*(KmNaip/Nasl)*(KmNaip/Nasl)) + 1.0));
+      real INAK = INAK_junc + INAK_sl;
+      real rkr = 1.00000/(1.00000+exp((V+74.0000)/24.0000));
+      real IKr = gkr*rkr*vek*xkr;//xkr->xr //rkr->rr
+      real IKs_junc = (xks*xks)*Fjunc*gks_junc*veks;
+      real IKs_sl = (xks*xks)*Fsl*gks_sl*veks;
+      real IKs = IKs_junc + IKs_sl;
+      real kp_kp = 1.00000/(1.00000+exp(7.48800 - V/5.98000));//kp_kp->kp
+      real IKp_junc = Fjunc*gkp*kp_kp*vek;
+      real IKp_sl = Fsl*gkp*kp_kp*vek;
+      real IKp = IKp_junc + IKp_sl;
+      real Ito = GtoFast*vek*xtf*ytf;
+      real IKur = Gkur*vek*xkur*ykur;
+
+
+         real _expensive_functions_035 = exp(0.23849999999999999*vek);
+         real aki = 1.02/(7.3545425104644605e-7*_expensive_functions_035 + 1);
+         real _expensive_functions_036 = exp(-0.51429999999999998*vek);
+         real _expensive_functions_037 = exp(0.080320000000000003*vek);
+         real _expensive_functions_038 = exp(0.061749999999999999*vek);
+         real bki = (0.76262400650630813*_expensive_functions_037 + 1.1534056351865558e-16*_expensive_functions_038)/(0.086772294157693317*_expensive_functions_036 + 1.0);
+      real kiss = aki/(aki + bki);
+         real _expensive_functions_039 = sqrt(Ko);
+         real IK1 = 0.43033148291193518*_expensive_functions_039*kiss*vek*(0.052499999999999998*AF + 0.052499999999999998);
+
+      real fcaBj_diff = 1.7*Caj*(-fcaBj + 1.0) - 0.011900000000000001*fcaBj;
+      real fcaBsl_diff = 1.7*Casl*(-fcaBsl + 1) - 0.011900000000000001*fcaBsl;
+
+      real _expensive_functions_045 = exp(2.0*FoRT*V);
+      //real _expensive_functions_045 = _interpolant[2].eval(v);
+      real _expensive_functions_046 = exp(2.0*FoRT*V);
+      //real _expensive_functions_046 = _interpolant[3].eval(v);
+      real ibarca_j = 4.0*FoRT*Frdy*pCa*V*(0.34100000000000003*Caj*_expensive_functions_046 - 0.34100000000000003*Cao)/(_expensive_functions_045 - 1.0);
+
+
+      //real _expensive_functions_047 = _interpolant[4].eval(v);
+      //real _expensive_functions_048 = _interpolant[5].eval(v);
+      real _expensive_functions_047 = exp(2.0*FoRT*V);
+      real _expensive_functions_048 = exp(2.0*FoRT*V);
+
+      real ibarca_sl = 4.0*FoRT*Frdy*pCa*V*(-0.34100000000000003*Cao + 0.34100000000000003*Casl*_expensive_functions_048)/(_expensive_functions_047 - 1.0);
+
+      //real _expensive_functions_049 = _interpolant[6].eval(v);
+      //real _expensive_functions_050 = _interpolant[7].eval(v);
+
+      real _expensive_functions_049 = exp(FoRT*V);
+      real _expensive_functions_050 = exp(FoRT*V);
+
+
+      real ibark = FoRT*Frdy*pK*V*(0.75*Ki*_expensive_functions_050 - 0.75*Ko)/(_expensive_functions_049 - 1.0);
+
+
+      //real _expensive_functions_051 = _interpolant[8].eval(v);
+      //real _expensive_functions_052 = _interpolant[9].eval(v);
+      real _expensive_functions_051 = exp(FoRT*V);
+      real _expensive_functions_052 = exp(FoRT*V);
+
+
+
+      real ibarna_j = FoRT*Frdy*pNa*V*(0.75*Naj*_expensive_functions_052 - 0.75*Nao)/(_expensive_functions_051 - 1.0);
+
+
+
+
+      //real _expensive_functions_053 = _interpolant[10].eval(v);
+      //real _expensive_functions_054 = _interpolant[11].eval(v);
+      real _expensive_functions_053 = exp(FoRT*V);
+      real _expensive_functions_054 = exp(FoRT*V);
+
+
+      real ibarna_sl = FoRT*Frdy*pNa*V*(-0.75*Nao + 0.75*Nasl*_expensive_functions_054)/(_expensive_functions_053 - 1.0);
+      real ICa_junc = 0.45000000000000001*Fjunc_CaL*_expensive_functions_055*d*f*ibarca_j*(-fcaBj + 1);
+      real ICa_sl = 0.45000000000000001*Fsl_CaL*_expensive_functions_056*d*f*ibarca_sl*(-fcaBsl + 1);
+      real ICaNa_junc = 0.45000000000000001*Fjunc_CaL*_expensive_functions_057*d*f*ibarna_j*(-fcaBj + 1);
+      real ICaNa_sl = 0.45000000000000001*Fsl_CaL*_expensive_functions_058*d*f*ibarna_sl*(-fcaBsl + 1);
+      real ICaK = 0.45000000000000001*_expensive_functions_059*d*f*ibark*(Fjunc_CaL*(-fcaBj + 1) + Fsl_CaL*(-fcaBsl + 1));
+      real Ka_junc = 1.0/(((Kdact/Caj)*(Kdact/Caj)) + 1.0);
+      real Ka_sl = 1.0/(((Kdact/Casl)*(Kdact/Casl)) + 1.0);
+
+
+      //real _expensive_functions_060 = _interpolant[12].eval(v);
+      
+      real _expensive_functions_060 = exp(FoRT*nu*V);
+
+
+      real s1_junc = (Naj*Naj*Naj)*Cao*_expensive_functions_060;
+
+      //real _expensive_functions_061 = _interpolant[13].eval(v);
+      real _expensive_functions_061 = exp(FoRT*nu*V);
+
+      real s1_sl = (Nasl*Nasl*Nasl)*Cao*_expensive_functions_061;
+
+      //real _expensive_functions_062 = _interpolant[14].eval(v);
+      real _expensive_functions_062 = exp(FoRT*V*(nu - 1.0));
+
+      real s2_junc = (Nao*Nao*Nao)*Caj*_expensive_functions_062;
+
+      real s3_junc = (KmNao*KmNao*KmNao)*Caj*(Caj/KmCai + 1.0) + (Nao*Nao*Nao)*Caj + (Naj*Naj*Naj)*Cao + (Nao*Nao*Nao)*KmCai*(((Naj/KmNai)*(Naj/KmNai)*(Naj/KmNai)) + 1) + (Naj*Naj*Naj)*KmCao;
+      
+      //real _expensive_functions_063 = _interpolant[15].eval(v);
+      real _expensive_functions_063 = exp(FoRT*V*(nu - 1.0));
+
+      real s2_sl = (Nao*Nao*Nao)*Casl*_expensive_functions_063;
+      real s3_sl = (Nasl*Nasl*Nasl)*Cao + (KmNao*KmNao*KmNao)*Casl*(Casl/KmCai + 1.0) + (Nao*Nao*Nao)*Casl + (Nao*Nao*Nao)*KmCai*(((Nasl/KmNai)*(Nasl/KmNai)*(Nasl/KmNai)) + 1.0) + (Nasl*Nasl*Nasl)*KmCao;
+      
+      //real _expensive_functions_065 = _interpolant[16].eval(v);
+      real _expensive_functions_065 = exp(FoRT*V*(nu - 1.0));
+
+      real Incx_junc = Fjunc*IbarNCX*Ka_junc*_expensive_functions_064*(s1_junc - s2_junc)/(s3_junc*(_expensive_functions_065*ksat + 1.0));
+      
+      //real _expensive_functions_067 = _interpolant[17].eval(v);
+      real _expensive_functions_067 = exp(FoRT*V*(nu - 1.0));
+
+      real Incx_sl = Fsl*IbarNCX*Ka_sl*_expensive_functions_066*(s1_sl - s2_sl)/(s3_sl*(_expensive_functions_067*ksat + 1.0));
+      real Caj_pow = pow(Caj, 1.6000000000000001);
+
+//std::cout << " Caj:  " << Caj << std::endl;
+
+
+
+      real Casl_pow = pow(Casl, 1.6000000000000001);
+      real Ipca_junc = Caj_pow*Fjunc*IbarSLCaP*_expensive_functions_068/(Caj_pow + _expensive_functions_069);
+#if 0
+std::cout << " Caj_pow:  " << Caj_pow << std::endl;
+std::cout << " _expensive_functions_068:  " << _expensive_functions_068 << std::endl;
+std::cout << " _expensive_functions_069:  " << _expensive_functions_069 << std::endl;
+#endif
+
+
+      real Ipca_sl = Casl_pow*Fsl*IbarSLCaP*_expensive_functions_070/(Casl_pow + _expensive_functions_071);
+      real Icabk_junc = Fjunc*GCaB*(-ECa_junc + V);
+
+#if 0
+std::cout << " V:  " << V << std::endl;
+std::cout << " ECa_junc:  " << ECa_junc << std::endl;
+#endif
+
+      real Icabk_sl = Fsl*GCaB*(-ECa_sl + V);
+      real _expensive_functions_072 = pow(ec50SR/Casr, 2.5);
+      real kCaSR = MaxSR - (MaxSR - MinSR)/(_expensive_functions_072 + 1.0);
+      real koSRCa = koCa/kCaSR;
+      real kiSRCa = kCaSR*kiCa;
+      real RI = -RyRi - RyRo - RyRr + 1.0;
+      real RyRr_diff = -(Caj*Caj)*RyRr*koSRCa - Caj*RyRr*kiSRCa + RI*kim + RyRo*kom;
+      real RyRo_diff = (Caj*Caj)*RyRr*koSRCa - Caj*RyRo*kiSRCa + RyRi*kim - RyRo*kom;
+      real RyRi_diff = (Caj*Caj)*RI*koSRCa + Caj*RyRo*kiSRCa - RyRi*kim - RyRi*kom;
+      real JSRCarel = RyRo*ks*(-Caj + Casr);
+      real _expensive_functions_074 = pow(Cai/Kmf, hillSRCaP);
+      real _expensive_functions_075 = pow(Casr/Kmr, hillSRCaP);
+      real _expensive_functions_076 = pow(Cai/Kmf, hillSRCaP);
+      real _expensive_functions_077 = pow(Casr/Kmr, hillSRCaP);
+      real Jserca = 1.0*Vmax_SRCaP*_expensive_functions_073*(_expensive_functions_076 - _expensive_functions_077)/(_expensive_functions_074 + _expensive_functions_075 + 1);
+      real JSRleak = (1.3370000000000001e-6*AF + 5.3480000000000003e-6)*(-Caj + Casr);
+      real NaBj_diff = -NaBj*koff_na + Naj*kon_na*(Bmax_Naj - NaBj);
+      real NaBsl_diff = -NaBsl*koff_na + Nasl*kon_na*(Bmax_Nasl - NaBsl);
+      real TnCL_diff = Cai*kon_tncl*(Bmax_TnClow - TnCL) - TnCL*koff_tncl;
+      real TnCHc_diff = Cai*kon_tnchca*(Bmax_TnChigh - TnCHc - TnCHm) - TnCHc*koff_tnchca;
+      real TnCHm_diff = Mgi*kon_tnchmg*(Bmax_TnChigh - TnCHc - TnCHm) - TnCHm*koff_tnchmg;
+      real CaM_diff = -CaM*koff_cam + Cai*kon_cam*(Bmax_CaM - CaM);
+      real Myc_diff = Cai*kon_myoca*(Bmax_myosin - Myc - Mym) - Myc*koff_myoca;
+      real Mym_diff = Mgi*kon_myomg*(Bmax_myosin - Myc - Mym) - Mym*koff_myomg;
+      real SRB_diff = Cai*kon_sr*(Bmax_SR - SRB) - SRB*koff_sr;
+      real JCaB_cytsol = CaM_diff + Myc_diff + Mym_diff + SRB_diff + TnCHc_diff + TnCHm_diff + TnCL_diff;
+      real SLLj_diff = Caj*kon_sll*(Bmax_SLlowj - SLLj) - SLLj*koff_sll;
+      real SLLsl_diff = Casl*kon_sll*(Bmax_SLlowsl - SLLsl) - SLLsl*koff_sll;
+      real SLHj_diff = Caj*kon_slh*(Bmax_SLhighj - SLHj) - SLHj*koff_slh;
+      real SLHsl_diff = Casl*kon_slh*(Bmax_SLhighsl - SLHsl) - SLHsl*koff_slh;
+      real JCaB_junc = SLHj_diff + SLLj_diff;
+      real JCaB_sl = SLHsl_diff + SLLsl_diff;
+      real Buff_Csqnb = 1.0/(Bmax_Csqn*KmCsqnb*(1.0/(Casr + KmCsqnb)/(Casr + KmCsqnb)) + 1.0);
+      real Casr_diff = Buff_Csqnb*(-JSRCarel - JSRleak*Vmyo/Vsr + Jserca);
+      real INa_tot_junc = ICaNa_junc + 3.0*INAK_junc + INaBk_junc + INaL_junc + INa_junc + 3.0*Incx_junc;
+      real INa_tot_sl = ICaNa_sl + 3.0*INAK_sl + INaBk_sl + INaL_sl + INa_sl + 3.0*Incx_sl;
+      real Naj_diff = -Cmem*INa_tot_junc/(Frdy*Vjunc) + Jna_juncsl*(-Naj + Nasl)/Vjunc - NaBj_diff;
+      real Nasl_diff = -Cmem*INa_tot_sl/(Frdy*Vsl) + Jna_juncsl*(Naj - Nasl)/Vsl + Jna_slmyo*(Nai - Nasl)/Vsl - NaBsl_diff;
+      real Nai_diff = Jna_slmyo*(-Nai + Nasl)/Vmyo;
+      real IK_tot = ICaK + IK1 + IKp + IKr + IKs + IKur - 2.0*INAK + Ito;
+      real Ki_diff = -Cmem*IK_tot/(Frdy*Vmyo);
+      real ICa_tot_junc = ICa_junc + Icabk_junc - 2.0*Incx_junc + Ipca_junc;
+
+#if 0
+std::cout << " ICa_junc:  " << ICa_junc << std::endl;
+std::cout << " Icabk_junc:  " << Icabk_junc << std::endl;
+std::cout << " Incx_junc:  " << Incx_junc << std::endl;
+std::cout << " Ipca_junc:  " << Ipca_junc << std::endl;
+#endif
+
+
+      real ICa_tot_sl = ICa_sl + Icabk_sl - 2.0*Incx_sl + Ipca_sl;
+      real Caj_diff = -0.5*Cmem*ICa_tot_junc/(Frdy*Vjunc) - JCaB_junc + JSRCarel*Vsr/Vjunc + JSRleak*Vmyo/Vjunc + Jca_juncsl*(-Caj + Casl)/Vjunc;
+      
+
+
+      // real Caj_diff_k1 = Caj_diff;
+      // {
+      //    ICa_junc = 
+      //    ICa_tot_junc = ICa_junc + Icabk_junc - 2.0*Incx_junc + Ipca_junc;
+      // }
+
+
+      // real Caj_diff_k2 = ;
+
+
+
+
+
+
+
+//std::cout << " Caj_diff:  " << Caj_diff << std::endl;
+//std::cout << " Caj:  " << Caj << std::endl;
+
+#if 0
+std::cout << " ICa_tot_junc:  " << ICa_tot_junc << std::endl;
+std::cout << " JCaB_junc:  " << JCaB_junc << std::endl;
+std::cout << " JSRCarel:  " << JSRCarel << std::endl;
+std::cout << " JSRleak:  " << JSRleak << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+#endif
+
+      real Casl_diff = -0.5*Cmem*ICa_tot_sl/(Frdy*Vsl) - JCaB_sl + Jca_juncsl*(Caj - Casl)/Vsl + Jca_slmyo*(Cai - Casl)/Vsl;
+      real Cai_diff = -JCaB_cytsol + Jca_slmyo*(-Cai + Casl)/Vmyo - Jserca*Vsr/Vmyo;
+
+      real Csqn_diff = ( kon_csqn*Casr)*(Bmax_Csqn - Csqn) - koff_csqn*Csqn;
+      //get Iion
+      real IClCa_junc = Fjunc*GClCa*(-ECl + V)/(1.0 + KdClCa/Caj);
+      real IClCa_sl = Fsl*GClCa*(-ECl + V)/(1.0 + KdClCa/Casl);
+      real IClCa = IClCa_junc + IClCa_sl;
+      real IClbk = GClB*(-ECl + V);
+
+      real INa_tot = INa_tot_junc + INa_tot_sl;
+      real ICl_tot = IClCa + IClbk;
+      real ICa_tot = ICa_tot_junc + ICa_tot_sl;//
+      real Iion = ICa_tot + ICl_tot + IK_tot + INa_tot;
+
+
+
+#if 0
+std::cout << " INa_tot:  " << INa_tot << std::endl;
+std::cout << " ICl_tot:  " << ICl_tot << std::endl;
+std::cout << " ICa_tot:  " << ICa_tot << std::endl;
+std::cout << " IK_tot:  " << IK_tot << std::endl;
+//std::cout << " Iion:  " << Iion << std::endl;
+#endif
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
       //get the gate updates (diagonalized exponential integrator)
       real v = V;
       real _d_RLA = _interpolant[0].eval(v);
@@ -2188,8 +2668,8 @@ void ThisReaction::calc(double _dt,
       real ECa_junc = 0.5*_expensive_functions_004/FoRT;
       real _expensive_functions_005 = log(Cao/Casl);
       real ECa_sl = 0.5*_expensive_functions_005/FoRT;
-      real vek = -EK + v;
-      real veks = -EKs + v;
+      real vek = -EK + V;
+      real veks = -EKs + V;
       real INa_junc = (m*m*m)*Fjunc*GNa*h*j*(-ENa_junc + v);
       real INa_sl = (m*m*m)*Fsl*GNa*h*j*(-ENa_sl + v);
       real INaL_junc = (mL*mL*mL)*Fjunc*GNaL*hL*(-ENa_junc + v);
@@ -2201,12 +2681,12 @@ void ThisReaction::calc(double _dt,
       real INAK_sl = Fsl*IbarNaK*Ko*fnak/((KmKo + Ko)*(((KmNaip/Nasl)*(KmNaip/Nasl)*(KmNaip/Nasl)*(KmNaip/Nasl)) + 1.0));
       real INAK = INAK_junc + INAK_sl;
       real rkr = _interpolant[43].eval(v);
-      real IKr = gkr*rkr*vek*xkr;
-      real IKs_junc = (xks*xks)*Fjunc*gks_junc*veks;
-      real IKs_sl = (xks*xks)*Fsl*gks_sl*veks;
+      real IKr = gkr*rkr*Vek*xkr;
+      real IKs_junc = (xks*xks)*Fjunc*gks_junc*Veks;
+      real IKs_sl = (xks*xks)*Fsl*gks_sl*Veks;
       real IKs = IKs_junc + IKs_sl;
       real kp_kp = _interpolant[42].eval(v);
-      real IKp_junc = Fjunc*gkp*kp_kp*vek;
+      real IKp_junc = Fjunc*gkp*kp_kp*Vek;
       real IKp_sl = Fsl*gkp*kp_kp*vek;
       real IKp = IKp_junc + IKp_sl;
       real Ito = GtoFast*vek*xtf*ytf;
@@ -2330,6 +2810,13 @@ void ThisReaction::calc(double _dt,
          _error += (_mi_old_RyRr-_mi_new_RyRr)*(_mi_old_RyRr-_mi_new_RyRr);
          _count++;
       } while (simdops::any(_error > 1e-100) && _count<50);
+*/
+
+
+
+
+
+
       //EDIT_STATE
       CaM += _dt*CaM_diff;
       Cai += _dt*Cai_diff;
@@ -2354,6 +2841,78 @@ void ThisReaction::calc(double _dt,
       TnCL += _dt*TnCL_diff;
       fcaBj += _dt*fcaBj_diff;
       fcaBsl += _dt*fcaBsl_diff;
+
+      RyRi += _dt*RyRi_diff;
+      RyRo += _dt*RyRo_diff;
+      RyRr += _dt*RyRr_diff;
+
+      Csqn += _dt*Csqn_diff;
+
+
+/*
+std::cout << " CaM:  " << CaM << std::endl;
+std::cout << " Cai:  " << Cai << std::endl;
+std::cout << " Caj:  " << Caj << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casr:  " << Casr << std::endl;
+std::cout << " Ki:  " << Ki << std::endl;
+std::cout << " fcaBj:  " << fcaBj << std::endl;
+std::cout << " fcaBsl:  " << fcaBsl << std::endl;
+
+
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+std::cout << " Casl:  " << Casl << std::endl;
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ #if 0
+      d += _dt*d_diff;
+      f += _dt*f_diff;
+      h += _dt*h_diff;
+      hL += _dt*hL_diff;
+      j += _dt*j_diff;
+      m += _dt*m_diff;
+      mL += _dt*mL_diff;
+      xkr += _dt*xkr_diff;
+      xks += _dt*xks_diff;
+      xkur += _dt*xkur_diff;
+      xtf += _dt*xtf_diff;
+      ykur += _dt*ykur_diff;
+      ytf += _dt*ytf_diff;
+ #endif
+
+
+
+
+/*
       d += _d_RLA*(d+_d_RLB);
       f += _f_RLA*(f+_f_RLB);
       h += _h_RLA*(h+_h_RLB);
@@ -2370,6 +2929,14 @@ void ThisReaction::calc(double _dt,
       RyRi += _dt*_mi_new_RyRi;
       RyRo += _dt*_mi_new_RyRo;
       RyRr += _dt*_mi_new_RyRr;
+*/
+
+
+
+//Xr1 = xr1_inf + (Xr1-xr1_inf)*exp(-_dt/tau_xr1);
+
+
+
       store(state_[__jj].CaM, CaM);
       store(state_[__jj].Cai, Cai);
       store(state_[__jj].Caj, Caj);
@@ -2409,7 +2976,31 @@ void ThisReaction::calc(double _dt,
       store(state_[__jj].xtf, xtf);
       store(state_[__jj].ykur, ykur);
       store(state_[__jj].ytf, ytf);
-      simdops::store(&__dVm.raw()[__ii],-Iion);
+
+      store(state_[__jj].Csqn, Csqn);
+      //simdops::store(&__dVm.raw()[__ii],-Iion);
+
+//below from BetterTT06
+      double __dVm_local[width];
+      simdops::store(&__dVm_local[0],-Iion);
+      {
+         int cursor = 0;
+         for (int __kk=0; __kk<width && __ii+__kk<nCells_; __kk++)
+         {
+            __dVm[__indexArray[__ii+__kk]] = __dVm_local[__kk];
+         }
+      }
+
+
+
+
+
+
+
+}////////////////end factor for loop
+
+
+
    }
 }
 #endif //USE_CUDA
@@ -2419,7 +3010,7 @@ string ThisReaction::methodName() const
    return "Grandi";
 }
 
-void ThisReaction::initializeMembraneVoltage(wo_mgarray_ptr<double> __Vm_m)
+void ThisReaction::initializeMembraneVoltage(ro_mgarray_ptr<int> indexArray, wo_mgarray_ptr<double> __Vm_m)
 {
    assert(__Vm_m.size() >= nCells_);
 
@@ -2433,6 +3024,94 @@ void ThisReaction::initializeMembraneVoltage(wo_mgarray_ptr<double> __Vm_m)
 #endif //USE_CUDA
 
 
+//cellML
+   double V_init = -7.34336366728778671e+01;
+   double V = V_init;
+   double NaBj_init = 3.61396062660070427e+00;
+   double NaBj = NaBj_init;
+   double NaBsl_init = 9.15153381546177336e+00;
+   double NaBsl = NaBsl_init;
+   double Naj_init = 7.88607791910409195e-01;
+   double Naj = Naj_init;
+   double Nasl_init = 9.15182798281732346e+00;
+   double Nasl = Nasl_init;
+   double Nai_init = 9.15199678386256998e+00;
+   double Nai = Nai_init;
+   double Ki_init = 120.0;
+   double Ki = Ki_init;
+   double Casr_init = 5.02305826642838293e-01;
+   double Casr = Casr_init;
+   double Caj_init = 3.25814677291117296e-04;
+   double Caj = Caj_init;
+   double Casl_init = 2.33018340557575125e-04;
+   double Casl = Casl_init;
+   double Cai_init = 2.10808768153058460e-04;
+   double Cai = Cai_init;
+   double m_init = 1.89326933812916480e-02;
+   double m = m_init;
+   double h_init = 3.15482710277587786e-01;
+   double h = h_init;
+   double j_init = 2.48034071360795916e-01;
+   double j = j_init;
+   double mL_init = 1.01974216400706526e-02;
+   double mL = mL_init;
+   double hL_init = 3.79829335413739144e-02;
+   double hL = hL_init;
+   double xkr_init = 1.31290096227093382e-03;
+   double xkr = xkr_init;
+   double xks_init = 7.49436760722081534e-03;
+   double xks = xks_init;
+   double xtf_init = 1.37939236359928058e-03;
+   double xtf = xtf_init;
+   double ytf_init = 9.45874848392074696e-01;
+   double ytf = ytf_init;
+   double xkur_init = 3.93548562883350357e-04;
+   double xkur = xkur_init;
+   double ykur_init = 9.58234428284286399e-01;
+   double ykur = ykur_init;
+   double d_init = 2.16850216379767157e-05;
+   double d = d_init;
+   double f_init = 9.98384427312367095e-01;
+   double f = f_init;
+   double fcaBj_init = 4.49572164109603364e-02;
+   double fcaBj = fcaBj_init;
+   double fcaBsl_init = 3.28512098597005947e-02;
+   double fcaBsl = fcaBsl_init;
+   double RyRr_init = 8.00819151705148946e-01;
+   double RyRr = RyRr_init;
+   double RyRo_init = 2.01567245823636694e-06;
+   double RyRo = RyRo_init;
+   double RyRi_init = 5.01323282772066123e-07;
+   double RyRi = RyRi_init;
+   double TnCL_init = 1.83143535034222225e-02;
+   double TnCL = TnCL_init;
+   double TnCHc_init = 1.27856586024588575e-01;
+   double TnCHc = TnCHc_init;
+   double TnCHm_init = 5.69999505293381902e-03;
+   double TnCHm = TnCHm_init;
+   double CaM_init = 7.02128101897185673e-04;
+   double CaM = CaM_init;
+   double Myc_init = 3.94923428392655786e-03;
+   double Myc = Myc_init;
+   double Mym_init = 1.35538532457244482e-01;
+   double Mym = Mym_init;
+   double SRB_init = 4.45327242854324807e-03;
+   double SRB = SRB_init;
+   double SLLj_init = 1.35640688636079511e-02;
+   double SLLj = SLLj_init;
+   double SLLsl_init = 2.14063418881809235e-02;
+   double SLLsl = SLLsl_init;
+   double SLHj_init = 1.03674364292988680e-01;
+   double SLHj = SLHj_init;
+   double SLHsl_init = 1.90759804527589089e-01;
+   double SLHsl = SLHsl_init;
+
+   double Csqn_init = 1.13337536953687845e+00;
+   double Csqn = Csqn_init;
+
+
+
+/* original cardioid code
    double V_init = -87.840000000000003;
    double V = V_init;
    double NaBj_init = 3.5;
@@ -2455,11 +3134,11 @@ void ThisReaction::initializeMembraneVoltage(wo_mgarray_ptr<double> __Vm_m)
    double Casl = Casl_init;
    double Cai_init = 0.0001;
    double Cai = Cai_init;
-   double m_init = 0.0;
+   double m_init = 0.0;//1.405627e-3;
    double m = m_init;
-   double h_init = 1.0;
+   double h_init = 1.0;//9.867005e-1;
    double h = h_init;
-   double j_init = 1.0;
+   double j_init = 1.0;//9.915620e-1; 
    double j = j_init;
    double mL_init = 0.0;
    double mL = mL_init;
@@ -2477,9 +3156,9 @@ void ThisReaction::initializeMembraneVoltage(wo_mgarray_ptr<double> __Vm_m)
    double xkur = xkur_init;
    double ykur_init = 1.0;
    double ykur = ykur_init;
-   double d_init = 0.0;
+   double d_init = 0.0;//7.175662e-6; 
    double d = d_init;
-   double f_init = 1.0;
+   double f_init = 1.0;//1.000681; 
    double f = f_init;
    double fcaBj_init = 0.025000000000000001;
    double fcaBj = fcaBj_init;
@@ -2513,6 +3192,15 @@ void ThisReaction::initializeMembraneVoltage(wo_mgarray_ptr<double> __Vm_m)
    double SLHj = SLHj_init;
    double SLHsl_init = 0.072999999999999995;
    double SLHsl = SLHsl_init;
+
+   double Csqn_init = 1.242988;
+   double Csqn = Csqn_init;
+*/
+
+
+
+
+   
    for (int iCell=0; iCell<nCells_; iCell++)
    {
       READ_STATE(CaM,iCell) = CaM;
@@ -2554,6 +3242,8 @@ void ThisReaction::initializeMembraneVoltage(wo_mgarray_ptr<double> __Vm_m)
       READ_STATE(xtf,iCell) = xtf;
       READ_STATE(ykur,iCell) = ykur;
       READ_STATE(ytf,iCell) = ytf;
+
+      READ_STATE(Csqn,iCell) = Csqn;
    }
 
    __Vm.assign(__Vm.size(), V_init);
@@ -2600,6 +3290,9 @@ enum varHandles
    xtf_handle,
    ykur_handle,
    ytf_handle,
+
+   Csqn_handle,
+
    NUMHANDLES
 };
 

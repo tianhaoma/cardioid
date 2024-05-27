@@ -6,7 +6,25 @@
 #include <fstream>
 #include <cassert>
 
+std::vector<int> readMaterial(OBJECT* obj, const std::string dataname) {
+   std::string filename;
+   objectGet(obj,dataname,filename,"");
 
+   std::ifstream infile(filename);
+   std::vector<int> material_data = readMaterialArray(infile);
+   return material_data;
+}
+
+std::vector<int> readMaterialArray(std::istream& stream) {
+   std::vector<int> material_data;
+   while(1) {
+      int value;
+      stream >> value;
+      if (!stream) {break;}
+      material_data.push_back(value);
+   }
+   return material_data;
+}
 
 std::set<int> readSet(std::istream& stream) {
    std::set<int> retval;

@@ -26,45 +26,49 @@ namespace Grandi
    struct State
    {
 
-      double CaM[SIMDOPS_FLOAT64V_WIDTH];
-      double Cai[SIMDOPS_FLOAT64V_WIDTH];
-      double Caj[SIMDOPS_FLOAT64V_WIDTH];
-      double Casl[SIMDOPS_FLOAT64V_WIDTH];
-      double Casr[SIMDOPS_FLOAT64V_WIDTH];
-      double Ki[SIMDOPS_FLOAT64V_WIDTH];
-      double Myc[SIMDOPS_FLOAT64V_WIDTH];
-      double Mym[SIMDOPS_FLOAT64V_WIDTH];
-      double NaBj[SIMDOPS_FLOAT64V_WIDTH];
-      double NaBsl[SIMDOPS_FLOAT64V_WIDTH];
-      double Nai[SIMDOPS_FLOAT64V_WIDTH];
-      double Naj[SIMDOPS_FLOAT64V_WIDTH];
-      double Nasl[SIMDOPS_FLOAT64V_WIDTH];
-      double RyRi[SIMDOPS_FLOAT64V_WIDTH];
-      double RyRo[SIMDOPS_FLOAT64V_WIDTH];
-      double RyRr[SIMDOPS_FLOAT64V_WIDTH];
-      double SLHj[SIMDOPS_FLOAT64V_WIDTH];
-      double SLHsl[SIMDOPS_FLOAT64V_WIDTH];
-      double SLLj[SIMDOPS_FLOAT64V_WIDTH];
-      double SLLsl[SIMDOPS_FLOAT64V_WIDTH];
-      double SRB[SIMDOPS_FLOAT64V_WIDTH];
-      double TnCHc[SIMDOPS_FLOAT64V_WIDTH];
-      double TnCHm[SIMDOPS_FLOAT64V_WIDTH];
-      double TnCL[SIMDOPS_FLOAT64V_WIDTH];
-      double d[SIMDOPS_FLOAT64V_WIDTH];
-      double f[SIMDOPS_FLOAT64V_WIDTH];
-      double fcaBj[SIMDOPS_FLOAT64V_WIDTH];
-      double fcaBsl[SIMDOPS_FLOAT64V_WIDTH];
-      double h[SIMDOPS_FLOAT64V_WIDTH];
-      double hL[SIMDOPS_FLOAT64V_WIDTH];
-      double j[SIMDOPS_FLOAT64V_WIDTH];
-      double m[SIMDOPS_FLOAT64V_WIDTH];
-      double mL[SIMDOPS_FLOAT64V_WIDTH];
-      double xkr[SIMDOPS_FLOAT64V_WIDTH];
-      double xks[SIMDOPS_FLOAT64V_WIDTH];
-      double xkur[SIMDOPS_FLOAT64V_WIDTH];
-      double xtf[SIMDOPS_FLOAT64V_WIDTH];
-      double ykur[SIMDOPS_FLOAT64V_WIDTH];
-      double ytf[SIMDOPS_FLOAT64V_WIDTH];
+
+
+      double CaM[SIMDOPS_FLOAT64V_WIDTH];//
+      double Cai[SIMDOPS_FLOAT64V_WIDTH];//
+      double Caj[SIMDOPS_FLOAT64V_WIDTH];//
+      double Casl[SIMDOPS_FLOAT64V_WIDTH];//
+      double Casr[SIMDOPS_FLOAT64V_WIDTH];//
+      double Ki[SIMDOPS_FLOAT64V_WIDTH];//
+      double Myc[SIMDOPS_FLOAT64V_WIDTH];//
+      double Mym[SIMDOPS_FLOAT64V_WIDTH];//
+      double NaBj[SIMDOPS_FLOAT64V_WIDTH];//
+      double NaBsl[SIMDOPS_FLOAT64V_WIDTH];//
+      double Nai[SIMDOPS_FLOAT64V_WIDTH];//
+      double Naj[SIMDOPS_FLOAT64V_WIDTH];//
+      double Nasl[SIMDOPS_FLOAT64V_WIDTH];//
+      double RyRi[SIMDOPS_FLOAT64V_WIDTH];//
+      double RyRo[SIMDOPS_FLOAT64V_WIDTH];//
+      double RyRr[SIMDOPS_FLOAT64V_WIDTH];//
+      double SLHj[SIMDOPS_FLOAT64V_WIDTH];//
+      double SLHsl[SIMDOPS_FLOAT64V_WIDTH];//
+      double SLLj[SIMDOPS_FLOAT64V_WIDTH];//
+      double SLLsl[SIMDOPS_FLOAT64V_WIDTH];//
+      double SRB[SIMDOPS_FLOAT64V_WIDTH];//
+      double TnCHc[SIMDOPS_FLOAT64V_WIDTH];//
+      double TnCHm[SIMDOPS_FLOAT64V_WIDTH];//
+      double TnCL[SIMDOPS_FLOAT64V_WIDTH];//
+      double d[SIMDOPS_FLOAT64V_WIDTH];//
+      double f[SIMDOPS_FLOAT64V_WIDTH];//
+      double fcaBj[SIMDOPS_FLOAT64V_WIDTH];//
+      double fcaBsl[SIMDOPS_FLOAT64V_WIDTH];//
+      double h[SIMDOPS_FLOAT64V_WIDTH];//
+      double hL[SIMDOPS_FLOAT64V_WIDTH];//
+      double j[SIMDOPS_FLOAT64V_WIDTH];//
+      double m[SIMDOPS_FLOAT64V_WIDTH];//
+      double mL[SIMDOPS_FLOAT64V_WIDTH];//
+      double xkr[SIMDOPS_FLOAT64V_WIDTH];//
+      double xks[SIMDOPS_FLOAT64V_WIDTH];//
+      double xkur[SIMDOPS_FLOAT64V_WIDTH];////ikurr
+      double xtf[SIMDOPS_FLOAT64V_WIDTH];//x
+      double ykur[SIMDOPS_FLOAT64V_WIDTH];//s
+      double ytf[SIMDOPS_FLOAT64V_WIDTH];//y
+
+      double Csqn[SIMDOPS_FLOAT64V_WIDTH];
    };
 #endif //USE_CUDA
 
@@ -96,10 +100,11 @@ namespace Grandi
       double RA;
     public:
       void calc(double dt,
+                ro_mgarray_ptr<int> ___indexArray,
                 ro_mgarray_ptr<double> Vm_m,
                 ro_mgarray_ptr<double> iStim_m,
                 wo_mgarray_ptr<double> dVm_m);
-      void initializeMembraneVoltage(wo_mgarray_ptr<double> Vm);
+      void initializeMembraneVoltage(ro_mgarray_ptr<int> indexArray, wo_mgarray_ptr<double> Vm);
       virtual ~ThisReaction();
 #ifdef USE_CUDA
       void constructKernel();

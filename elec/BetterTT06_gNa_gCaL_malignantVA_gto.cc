@@ -11,7 +11,7 @@
  */
 
 
-#include "BetterTT06.hh"
+#include "BetterTT06_gNa_gCaL_malignantVA_gto.hh"
 #include "object_cc.hh"
 #include "mpiUtils.h"
 #include <cmath>
@@ -66,9 +66,9 @@ static const char* interpName[] = {
 };
 
 
-   REACTION_FACTORY(BetterTT06)(OBJECT* obj, const double _dt, const int numPoints, const ThreadTeam&)
+   REACTION_FACTORY(BetterTT06_gNa_gCaL_malignantVA_gto)(OBJECT* obj, const double _dt, const int numPoints, const ThreadTeam&)
    {
-      BetterTT06::ThisReaction* reaction = new BetterTT06::ThisReaction(numPoints, _dt);
+      BetterTT06_gNa_gCaL_malignantVA_gto::ThisReaction* reaction = new BetterTT06_gNa_gCaL_malignantVA_gto::ThisReaction(numPoints, _dt);
 
       //override the defaults
       //EDIT_PARAMETERS
@@ -89,8 +89,8 @@ static const char* interpName[] = {
       //setDefault(g_CaL, 4.776e-5);
       setDefault(g_bca, 0.000592000000000000);
       setDefault(g_pCa, 0.123800000000000);
-      setDefault(g_Na, 14.8380000000000);
-      //setDefault(g_Na, 5.932);
+      //setDefault(g_Na, 14.8380000000000);
+      setDefault(g_Na, 5.932);
       setDefault(g_K1, 5.40500000000000);
       setDefault(g_pK, 0.0146000000000000);
       setDefault(g_Kr, 0.153000000000000);
@@ -108,13 +108,13 @@ static const char* interpName[] = {
       double __melodee_temp_004 = celltype == 0;
       if (__melodee_temp_004)
       {
-         g_to = 0.0730000000000000;
-         //g_to = 0.0730000000000000*4;
+         //g_to = 0.0730000000000000;
+         g_to = 0.0730000000000000*4;
       }
       else
       {
-         g_to = 0.294000000000000;
-         //g_to = 0.294000000000000*4;
+         //g_to = 0.294000000000000;
+         g_to = 0.294000000000000*4;
       }
       setDefault(g_to, g_to);
       reaction->celltype = celltype;
@@ -205,7 +205,7 @@ static const char* interpName[] = {
    }
 #undef setDefault
 
-namespace BetterTT06 
+namespace BetterTT06_gNa_gCaL_malignantVA_gto 
 {
 
 void ThisReaction::createInterpolants(const double _dt) {
@@ -1656,7 +1656,7 @@ void ThisReaction::calc(double _dt,
    
 string ThisReaction::methodName() const
 {
-   return "BetterTT06";
+   return "BetterTT06_gNa_gCaL_malignantVA_gto";
 }
 
 void ThisReaction::initializeMembraneVoltage(ro_mgarray_ptr<int> __indexArray_m, wo_mgarray_ptr<double> __Vm_m)
