@@ -305,11 +305,11 @@ int main(int argc, char *argv[])
    mesh->SetAttributes();
    EndTimer();
 
-   const char omesh_file[] = "mesh-after-read.vtk";
-   ofstream omesh(omesh_file);
-   omesh.precision(14);
-   mesh->PrintVTK(omesh);
-   cout << "New VTK mesh file: " << omesh_file << endl;
+   //const char omesh_file[] = "mesh-after-read.vtk";
+   //ofstream omesh(omesh_file);
+   //omesh.precision(14);
+   //mesh->PrintVTK(omesh);
+   //cout << "New VTK mesh file: " << omesh_file << endl;
 
 
    StartTimer("Partition Mesh");
@@ -405,15 +405,15 @@ int main(int argc, char *argv[])
 
 for (int ielem=0; ielem<mesh->GetNE(); ielem++)
       {
-   mesh->SetAttribute(ielem, 1);
+   //mesh->SetAttribute(ielem, 1);
             //std::cout << "New attr :" << mesh->GetElement(ielem)->GetAttribute() << std::endl;
       }
 
-   const char omesh_file_[] = "mesh-after-setAttr.vtk";
-   ofstream omesh_(omesh_file_);
-   omesh_.precision(14);
-   mesh->PrintVTK(omesh_);
-   cout << "New VTK mesh file: " << omesh_file_ << endl;
+   //const char omesh_file_[] = "mesh-after-setAttr.vtk";
+   //ofstream omesh_(omesh_file_);
+   //omesh_.precision(14);
+   //mesh->PrintVTK(omesh_);
+   //cout << "New VTK mesh file: " << omesh_file_ << endl;
    
    if (my_rank == 0)
    {
@@ -423,11 +423,11 @@ for (int ielem=0; ielem<mesh->GetNE(); ielem++)
    }
    ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, *mesh, pmeshpart);
 
-   const char omesh_file_p[] = "pmesh-after-p.vtk";
-   ofstream omesh_p(omesh_file_p);
-   omesh_p.precision(14);
-   pmesh->PrintVTK(omesh_p);
-   cout << "New VTK pmesh file: " << omesh_file_p << endl;
+   //const char omesh_file_p[] = "pmesh-after-p.vtk";
+   //ofstream omesh_p(omesh_file_p);
+   //omesh_p.precision(14);
+   //pmesh->PrintVTK(omesh_p);
+   //cout << "New VTK pmesh file: " << omesh_file_p << endl;
 
    
    // Build a new FEC...
@@ -562,9 +562,9 @@ for (int ielem=0; ielem<mesh->GetNE(); ielem++)
          //cellTypes.push_back(material[globalvert_from_ranklookup[ranklookup]]);
       }
       //for(auto i: cellTypes)
-      {
-         std::cout<< "myrank:"<< my_rank<< "," << cellTypes.size() << std::endl;
-      }
+      //{
+         //std::cout<< "myrank:"<< my_rank<< "," << cellTypes.size() << std::endl;
+      //}
       
    }
    else
