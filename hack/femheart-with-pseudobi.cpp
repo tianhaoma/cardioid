@@ -1,0 +1,959 @@
+#include "mfem.hpp"
+#include "object.h"
+#include "object_cc.hh"
+#include "ddcMalloc.h"
+#include "pio.h"
+#include "pioFixedRecordHelper.h"
+#include "units.h"
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <unordered_map>
+#include <cassert>
+#include <memory>
+#include <set>
+#include <dirent.h>
+#include <regex.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include "util.hpp"
+#include "MatrixElementPiecewiseCoefficient.hpp"
+#include "cardiac_coefficients.hpp"
+
+#define StartTimer(x)
+#define EndTimer()
+
+using namespace mfem;
+
+MPI_Comm COMM_LOCAL = MPI_COMM_WORLD;
+
+/**
+ * 检查电导率张量是否已正确设置
+ * 
+ * @param sigma 要检查的电导率张量
+ * @throws 如果电导率张量为空则抛出异常
+ */
+void checkConductivityTensors(MatrixElementPiecewiseCoefficient& sigma) {
+    // 检查 heartConductivities_ 中是否有条目
+    if (sigma.heartConductivities_.empty()) {
+        throw std::runtime_error("错误：电导率张量为空!");
+    }
+}
+
+/**
+ * 求解椭圆问题，从跨膜电位(V_m)恢复细胞外电位(u_e)
+ * -∇·((σ_i + σ_e)∇u_e) = ∇·(σ_i∇V_m)
+ * 仅使用基于纤维方向的电导率
+ *
+ * @param pmesh 并行网格
+ * @param pfespace 并行有限元空间
+ * @param V_m 跨膜电位(输入)
+ * @param u_e 细胞外电位(输出)
+ * @param sigma_i_values 细胞内电导率值数组
+ * @param sigma_e_values 细胞外电导率值数组
+ * @param fiber_quat 纤维方向四元数
+ * @param ess_tdof_list 必要边界条件
+ * @param heartRegions 心脏区域列表
+ * @param print_level 求解器打印级别(0-3)，所有进程必须使用相同的值
+ * @return PCG迭代次数或-1(如果失败)
+ */
+int solvePseudoBidomainForUe(
+    ParMesh* pmesh,
+    ParFiniteElementSpace* pfespace,
+    ParGridFunction& V_m,
+    ParGridFunction& u_e,
+    const std::vector<double>& sigma_i_values,
+    const std::vector<double>& sigma_e_values,
+    std::shared_ptr<ParGridFunction>& fiber_quat,
+    Array<int>& ess_tdof_list,
+    const std::vector<int>& heartRegions,
+    int print_level = 2)
+{
+    int my_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+    
+    // 检查输入参数 - 所有进程都必须执行相同的检查
+    if (sigma_i_values.size() < 3 || sigma_e_values.size() < 3) {
+        if (my_rank == 0) {
+            std::cerr << "错误：电导率数组大小不足。" << std::endl;
+        }
+        return -1;  // 所有进程一起返回
+    }
+    
+    if (heartRegions.size() * 3 != sigma_i_values.size() || 
+        heartRegions.size() * 3 != sigma_e_values.size()) {
+        if (my_rank == 0) {
+            std::cerr << "错误：电导率数组大小与心脏区域数量不匹配。" << std::endl;
+            std::cerr << "心脏区域数量: " << heartRegions.size() << std::endl;
+            std::cerr << "细胞内电导率值数量: " << sigma_i_values.size() << std::endl;
+            std::cerr << "细胞外电导率值数量: " << sigma_e_values.size() << std::endl;
+        }
+        return -1;  // 所有进程一起返回
+    }
+    
+    if (my_rank == 0 && print_level > 0) {
+        std::cout << "使用基于纤维方向的电导率求解伪双域模型..." << std::endl;
+    }
+    
+    // 创建基于纤维方向的电导率
+    MatrixElementPiecewiseCoefficient sigma_i(fiber_quat);
+    MatrixElementPiecewiseCoefficient sigma_sum(fiber_quat);
+    
+    // 设置电导率张量
+    for (int ii = 0; ii < heartRegions.size(); ii++) {
+        int heartCursor = 3 * ii;
+        
+        Vector sigma_i_vec(3);
+        Vector sigma_e_vec(3);
+        Vector sigma_sum_vec(3);
+        
+        for (int jj = 0; jj < 3; jj++) {
+            sigma_i_vec[jj] = sigma_i_values[heartCursor + jj];
+            sigma_e_vec[jj] = sigma_e_values[heartCursor + jj];
+            sigma_sum_vec[jj] = -(sigma_i_vec[jj] + sigma_e_vec[jj]);
+        }
+        
+        sigma_i.heartConductivities_[heartRegions[ii]] = sigma_i_vec;
+        sigma_sum.heartConductivities_[heartRegions[ii]] = sigma_sum_vec;
+    }
+    
+    // 检查张量是否正确设置 - 所有进程都必须执行这个检查
+    bool tensors_valid = true;
+    if (sigma_i.heartConductivities_.empty() || sigma_sum.heartConductivities_.empty()) {
+        tensors_valid = false;
+        if (my_rank == 0) {
+            std::cerr << "错误：电导率张量未正确初始化。" << std::endl;
+        }
+    }
+    
+    // 使用集体通信确保所有进程一致
+    int global_tensors_valid = tensors_valid ? 1 : 0;
+    int result;
+    MPI_Allreduce(&global_tensors_valid, &result, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (result == 0) {
+        return -1;  // 所有进程一起返回
+    }
+    
+    // 设置方程左侧: -∇·((σ_i + σ_e)∇u_e)
+    ParBilinearForm *a = new ParBilinearForm(pfespace);
+    a->AddDomainIntegrator(new DiffusionIntegrator(sigma_sum));
+    a->Assemble();
+    
+    // 形成系统矩阵
+    HypreParMatrix A;
+    a->FormSystemMatrix(ess_tdof_list, A);
+    
+    // 设置方程右侧: ∇·(σ_i∇V_m)
+    // 创建一个双线性形式计算散度项
+    ParBilinearForm temp_form(pfespace);
+    temp_form.AddDomainIntegrator(new DiffusionIntegrator(sigma_i));
+    temp_form.Assemble();
+    
+    // 获取V_m的真实自由度
+    Vector vm_true(pfespace->GetTrueVSize());
+    V_m.GetTrueDofs(vm_true);
+    
+    // 形成临时系统矩阵
+    HypreParMatrix A_temp;
+    temp_form.FormSystemMatrix(ess_tdof_list, A_temp);
+    
+    // 设置右侧向量
+    Vector rhs(pfespace->GetTrueVSize());
+    rhs = 0.0;
+    
+    // 注意这里使用负号，因为我们需要右侧是 ∇·(σ_i∇V_m) 而不是 -∇·(σ_i∇V_m)
+    A_temp.Mult(1.0, vm_true, 0.0, rhs);
+    
+    // 添加监控输出，但不影响程序流程
+    if (my_rank == 0 && print_level > 1) {
+        std::cout << "右侧向量范数: " << rhs.Norml2() << std::endl;
+        
+        // 输出右侧向量的一些值，帮助诊断
+        if (rhs.Size() > 0) {
+            std::cout << "右侧向量的前几个值: ";
+            for (int i = 0; i < std::min(5, rhs.Size()); i++) {
+                std::cout << rhs[i] << " ";
+            }
+            std::cout << std::endl;
+        }
+        
+        // 检查是否有过多的零值或异常值
+        int zero_count = 0;
+        double max_abs = 0.0;
+        for (int i = 0; i < rhs.Size(); i++) {
+            if (fabs(rhs[i]) < 1e-10) zero_count++;
+            max_abs = std::max(max_abs, fabs(rhs[i]));
+        }
+        std::cout << "右侧向量中接近零的值数量: " << zero_count 
+                  << " (总数: " << rhs.Size() << ")" << std::endl;
+        std::cout << "右侧向量中最大绝对值: " << max_abs << std::endl;
+    }
+    
+    // 准备解向量
+    Vector X(rhs.Size());
+    X = 0.0;
+    
+    // 求解系统 A * X = rhs
+    HyprePCG pcg(A);
+    pcg.SetTol(1e-12);
+    pcg.SetMaxIter(2000);
+    pcg.SetPrintLevel(print_level);
+    HypreBoomerAMG amg(A);
+    pcg.SetPreconditioner(amg);
+    
+    // 添加额外的监控，但不影响程序流程
+    if (my_rank == 0 && print_level > 0) {
+        std::cout << "开始求解线性系统，大小: " << rhs.Size() << std::endl;
+        std::cout << "矩阵大小: " << A.Height() << " x " << A.Width() << std::endl;
+    }
+    
+    // PCG求解已经是一个集体操作，所有进程必须参与
+    pcg.Mult(rhs, X);
+    
+    // 检查解向量范围，防止数值过大 - 只影响输出，不影响流程
+    if (my_rank == 0 && print_level > 0) {
+        double min_val = X.Min();
+        double max_val = X.Max();
+        std::cout << "解的范围：" << min_val << " 到 " << max_val << std::endl;
+        std::cout << "解向量范数: " << X.Norml2() << std::endl;
+        
+        // 检查解是否有合理的值
+        int zero_count = 0;
+        int large_count = 0;
+        double threshold = 1000.0;  // 定义"大值"的阈值
+        
+        for (int i = 0; i < X.Size(); i++) {
+            if (fabs(X[i]) < 1e-10) zero_count++;
+            if (fabs(X[i]) > threshold) large_count++;
+        }
+        
+        std::cout << "解向量中接近零的值数量: " << zero_count 
+                  << " (" << (100.0 * zero_count / X.Size()) << "%)" << std::endl;
+        
+        if (large_count > 0) {
+            std::cout << "警告: 解向量中有 " << large_count 
+                      << " 个绝对值大于 " << threshold << " 的值" << std::endl;
+        }
+    }
+    
+    // 将解向量复制到u_e - 所有进程都需要执行
+    u_e.SetFromTrueDofs(X);
+    
+    // 清理
+    delete a;
+    
+    // 获取迭代次数
+    int num_iterations = 0;
+    pcg.GetNumIterations(num_iterations);
+    return num_iterations;
+}
+
+//Stolen from SingleCell
+class Timeline
+{
+ public:
+   Timeline(double dt, double duration)
+   {
+      maxTimesteps_ = round(duration/dt);
+      dt_ = duration/maxTimesteps_;
+   }
+   int maxTimesteps() const { return maxTimesteps_; };
+   double dt() const { return dt_; }
+   double maxTime() const { return dt_*maxTimesteps_; }
+   double realTimeFromTimestep(int timestep) const
+   {
+      return timestep*dt_;
+   }
+   int timestepFromRealTime(double realTime) const
+   {
+      return round(realTime/dt_);
+   }
+   std::string outputIdFromTimestep(const int timestep) const
+   {
+      double resolution = 1e-3;
+      int width = 8;
+      while (resolution > dt_) {
+         resolution /= 10;
+         width++;
+      }
+      std::stringstream ss;
+      ss << std::setfill('0') << std::setw(width)
+         << int(round(dt_*timestep/resolution));
+      return ss.str();
+   }
+
+ private:
+   double dt_;
+   int maxTimesteps_;
+};
+
+class OutputCoordinator
+{
+
+ private:
+   
+};
+
+void recursive_mkdir(const std::string dirname, mode_t mode=S_IRWXU|S_IRWXG)
+{
+   int startSearch=0;
+   do
+   {
+      int endSearch = dirname.find("/", startSearch);
+      //if directory doesn't exist
+      if (endSearch < 0) {
+         endSearch = dirname.length();
+      }
+      std::string thisDirname = dirname.substr(0, endSearch);
+      DIR* dir = opendir(thisDirname.c_str());
+      if (dir)
+      {
+         closedir(dir);
+      }
+      else if (ENOENT == errno) {
+         //make the directory
+         int ret = mkdir(thisDirname.c_str(), mode);
+         assert(ret == 0);
+      }
+      startSearch=endSearch+1;
+   } while (startSearch < dirname.length());
+}
+
+void save1dNumpyArray(const std::string filename, const std::vector<double>& data)
+{
+   const int NUMPY_HEADER_SIZE = 128;
+   char numpyHeaderFull[NUMPY_HEADER_SIZE];
+   //FIXME, report the correct endianness.  I'm too lazy ATM.
+   char numpyHeader1[] = 
+      "\x93NUMPY\x01\x00\x76\x00{'descr': '<f8', 'fortran_order': False, 'shape': (";
+   char numpyHeader2[] = ",)}";
+   int cursor=0;
+   memcpy(numpyHeaderFull+cursor, numpyHeader1, sizeof(numpyHeader1)-1);
+   cursor += sizeof(numpyHeader1)-1;
+   {
+      std::stringstream ss;
+      ss << data.size();
+      ss.str();
+      memcpy(numpyHeaderFull+cursor,ss.str().c_str(),ss.str().size());
+      cursor += ss.str().size();
+   }
+   memcpy(numpyHeaderFull+cursor,numpyHeader2, sizeof(numpyHeader2)-1);
+   cursor += sizeof(numpyHeader2)-1;
+   for (; cursor<NUMPY_HEADER_SIZE-1; cursor++) {
+      numpyHeaderFull[cursor] = ' ';
+   }
+   numpyHeaderFull[NUMPY_HEADER_SIZE-1] = '\n';
+   FILE* numpyFile = fopen(filename.c_str(), "w");
+   assert(numpyFile != NULL);
+   std::size_t bytesWritten = fwrite(numpyHeaderFull, sizeof(char), NUMPY_HEADER_SIZE, numpyFile);
+   assert(bytesWritten == NUMPY_HEADER_SIZE);
+   std::size_t doublesWritten = fwrite(&data[0], sizeof(double), data.size(), numpyFile);
+   assert(doublesWritten == data.size());
+   fclose(numpyFile);
+}
+
+int main(int argc, char *argv[])
+{
+   MPI_Init(NULL,NULL);
+   int num_ranks, my_rank;
+   MPI_Comm_size(COMM_LOCAL,&num_ranks);
+   MPI_Comm_rank(COMM_LOCAL,&my_rank);
+
+   units_internal(1e-3, 1e-9, 1e-3, 1e-3, 1, 1e-9, 1);
+   units_external(1e-3, 1e-9, 1e-3, 1e-3, 1, 1e-9, 1);
+
+   if (my_rank == 0)
+   {
+      std::cout << "Initializing with " << num_ranks << " MPI ranks." << std::endl;
+   }
+   
+   int order = 1;
+
+   std::vector<std::string> objectFilenames;
+   if (argc == 1)
+      objectFilenames.push_back("femheart.data");
+
+   for (int iargCursor=1; iargCursor<argc; iargCursor++)
+      objectFilenames.push_back(argv[iargCursor]);
+
+   if (my_rank == 0) {
+      for (int ii=0; ii<objectFilenames.size(); ii++)
+	 object_compilefile(objectFilenames[ii].c_str());
+   }
+   object_Bcast(0,MPI_COMM_WORLD);
+
+   OBJECT* obj = object_find("femheart", "HEART");
+   assert(obj != NULL);
+
+   StartTimer("Read the mesh");
+   // Read shared global mesh
+   mfem::Mesh *mesh = ecg_readMeshptr(obj, "mesh");
+   EndTimer();
+   int dim = mesh->Dimension();
+
+   //Fill in the MatrixElementPiecewiseCoefficients
+   std::vector<int> heartRegions;
+   objectGet(obj,"heart_regions", heartRegions);
+
+   std::vector<double> sigma_m;
+   objectGet(obj,"sigma_m",sigma_m);
+   assert(heartRegions.size()*3 == sigma_m.size());
+
+   // 读取细胞内电导率
+   std::vector<double> sigma_i_values;
+   objectGet(obj, "sigma_i", sigma_i_values);
+   assert(heartRegions.size()*3 == sigma_i_values.size());
+
+   // 读取细胞外电导率
+   std::vector<double> sigma_e_values;
+   objectGet(obj, "sigma_e", sigma_e_values);
+   assert(heartRegions.size()*3 == sigma_e_values.size());
+
+   // 检查是否应该求解细胞外电位
+   bool solveForUe;
+   objectGet(obj, "solve_for_ue", solveForUe, "1");  // 默认启用
+
+   double dt;
+   objectGet(obj,"dt",dt,"0.01 ms");
+   double Bm;
+   objectGet(obj,"Bm",Bm,"140"); // 1/mm
+   double Cm;
+   objectGet(obj,"Cm",Cm,"0.01"); // 1 uF/cm^2 = 0.01 uF/mm^2
+ 
+   std::string reactionName;
+   objectGet(obj, "reaction", reactionName, "BetterTT06");
+
+   std::string outputDir;
+   objectGet(obj, "outdir", outputDir, ".");
+   
+   double endTime;
+   objectGet(obj, "end_time", endTime, "0 ms");
+
+   double outputRate;
+   objectGet(obj, "output_rate", outputRate, "1 ms");
+
+   //double checkpointRate;
+   //objectGet(obj, "checkpoint_rate", checkpointRate, "100 ms");
+
+   double initVm;
+   objectGet(obj, "init_vm", initVm, "-83");
+
+   bool useNodalIion;
+   objectGet(obj, "nodal_ion", useNodalIion, "1");
+
+   StimulusCollection stims(dt);
+   {
+      std::vector<std::string> stimulusNames;
+      objectGet(obj, "stimulus", stimulusNames);
+      for (auto name : stimulusNames)
+      {
+         OBJECT* stimobj = object_find(name.c_str(), "STIMULUS");
+         assert(stimobj != NULL);
+         int numTimes;
+         objectGet(stimobj, "n", numTimes, "1");
+         double bcl;
+         objectGet(stimobj, "bcl", bcl, "0 ms");
+         assert(numTimes == 1 || bcl != 0);
+         double startTime;
+         objectGet(stimobj, "start", startTime, "0 ms");
+         double duration;
+         objectGet(stimobj, "duration", duration, "1 ms");
+         double strength;
+         objectGet(stimobj, "strength", strength, "0"); //uA/uF
+         assert(strength >= 0);
+         std::string location;
+         objectGet(stimobj, "where", location, "");
+         assert(!location.empty());
+         OBJECT* locobj = object_find(location.c_str(), "REGION");
+         assert(locobj != NULL);
+         std::string regionType;
+         objectGet(locobj, "type", regionType, "");
+         assert(!regionType.empty());
+         shared_ptr<StimulusLocation> stimLoc;
+         if (regionType == "ball")
+         {
+            std::vector<double> center;
+            objectGet(locobj, "center", center);
+            assert(center.size() == 3);
+            double radius;
+            objectGet(locobj, "radius", radius, "-1");
+            assert(radius >= 0);
+            stimLoc = std::make_shared<CenterBallStimulus>(center[0],center[1],center[2],radius);
+         }
+         else if (regionType == "box")
+         {
+            std::vector<double> lower;
+            objectGet(locobj, "lower", lower);
+            assert(lower.size() == 3);
+            vector<double> upper;
+            objectGet(locobj, "upper", upper);
+            assert(upper.size() == 3);
+            stimLoc = std::make_shared<BoxStimulus>
+               (lower[0], upper[0],
+                lower[1], upper[1],
+                lower[2], upper[2]);
+         }
+         shared_ptr<StimulusWaveform> stimWave(new SquareWaveform());
+         stims.add(Stimulus(numTimes, startTime, duration, bcl, strength, stimLoc, stimWave));
+      }
+   }
+   
+   Timeline timeline(dt, endTime);   
+
+   StartTimer("Setting Attributes");
+   mesh->SetAttributes();
+   EndTimer();
+
+   StartTimer("Partition Mesh");
+   // If I read correctly, pmeshpart will now point to an integer array
+   //  containing a partition ID (rank!) for every element ID.
+   int *pmeshpart = mesh->GeneratePartitioning(num_ranks);
+   EndTimer();
+
+
+   //Go through all the elements and label the partitioning for the vertices
+   std::vector<set<int> > pvertset(mesh->GetNV());
+   for (int ielem=0; ielem<mesh->GetNE(); ielem++)
+   {
+      Array<int> verts;
+      mesh->GetElementVertices(ielem, verts);
+      for (int ivert=0; ivert<verts.Size(); ivert++)
+      {
+         pvertset[verts[ivert]].insert(pmeshpart[ielem]);
+      }
+   }
+
+   std::vector<int> local_extents(num_ranks+1);
+   {
+      std::vector<int> local_counts(num_ranks, 0);
+      for(int i=0; i<mesh->GetNV(); i++)
+      {
+         if ( ! pvertset[i].empty())
+         {
+            local_counts[*(pvertset[i].begin())]++;
+         }
+      }
+
+      local_extents[0] = 0;
+      for (int irank=0; irank<num_ranks; irank++)
+      {
+         local_extents[irank+1] = local_extents[irank]+local_counts[irank];
+      }
+   }
+
+   std::vector<int> globalvert_from_ranklookup(local_extents[num_ranks]);
+   std::vector<int> ghostlocalvert_from_ranklookup(local_extents[num_ranks]);
+   {
+      std::vector<int> cursor_ghostlocal_from_rank(num_ranks, 0);
+      std::vector<int> cursor_ranklookup_from_rank = local_extents;
+      for(int i=0; i<mesh->GetNV(); i++)
+      {
+         if ( ! pvertset[i].empty())
+         {
+            int irank = *(pvertset[i].begin());
+            int ranklookup = cursor_ranklookup_from_rank[irank]++;
+            int globalvert = i;
+            int ghostlocal = cursor_ghostlocal_from_rank[irank];
+            globalvert_from_ranklookup[ranklookup] = globalvert;
+            ghostlocalvert_from_ranklookup[ranklookup] = ghostlocal;
+            for (const int used_by_this_rank : pvertset[i])
+            {
+               cursor_ghostlocal_from_rank[used_by_this_rank]++;
+            }
+         }
+      }
+   }
+
+   //Get the element material types for each index.
+   std::vector<int> material_from_ranklookup(local_extents[num_ranks]);
+   {
+      std::vector<int> element_from_globalvert(mesh->GetNV(), mesh->GetNE());
+      for (int ielem=0; ielem<mesh->GetNE(); ielem++)
+      {
+         Array<int> verts;
+         mesh->GetElementVertices(ielem, verts);
+         for (int ivert=0; ivert<verts.Size(); ivert++)
+         {
+            element_from_globalvert[verts[ivert]] = std::min(element_from_globalvert[verts[ivert]], ielem);
+         }
+      }
+      std::vector<int> cursor_ranklookup_from_rank = local_extents;
+      for(int i=0; i<mesh->GetNV(); i++)
+      {
+         if ( ! pvertset[i].empty())
+         {
+            int irank = *(pvertset[i].begin());
+            int ranklookup = cursor_ranklookup_from_rank[irank]++;
+            int globalvert = i;
+
+            int ielem = element_from_globalvert[globalvert];
+            material_from_ranklookup[ranklookup] = mesh->GetElement(ielem)->GetAttribute();
+         }
+      }
+   }
+   
+   if (my_rank == 0)
+   {
+      for(int i=0; i<num_ranks; i++) {
+         std::cout << "Rank " << i << " has " << local_extents[i+1]-local_extents[i] << " nodes!" << std::endl;
+      }
+   }
+   ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, *mesh, pmeshpart);
+   
+   // Build a new FEC...
+   FiniteElementCollection *fec;
+   if (my_rank == 0) { std::cout << "Creating new FEC..." << std::endl; }
+   fec = new H1_FECollection(order, dim);
+   // ...and corresponding FES
+   ParFiniteElementSpace *pfespace = new ParFiniteElementSpace(pmesh, fec);
+   FiniteElementSpace *fespace = new FiniteElementSpace(mesh, fec);
+   std::cout << "[" << my_rank << "] Number of finite element unknowns: "
+	     << pfespace->GetTrueVSize() << std::endl;
+
+   // 5. Determine the list of true (i.e. conforming) essential boundary DOFs
+   Array<int> ess_tdof_list;   // Essential true degrees of freedom
+   // "true" takes into account shared vertices.
+   {
+      Array<int> ess_bdr(pmesh->bdr_attributes.Max());
+      ess_bdr = 0;
+      pfespace->GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
+   }
+
+   // 7. Define the solution vector x as a finite element grid function
+   //    corresponding to pfespace. Initialize x with initial guess of zero,
+   //    which satisfies the boundary conditions.
+   ParGridFunction gf_Vm(pfespace);
+   ParGridFunction gf_ue(pfespace);  // 用于细胞外电位的网格函数
+   ParGridFunction gf_b(pfespace);
+   gf_Vm = initVm;
+   gf_ue = 0.0;  // 初始化为零
+   gf_b = 0.0;
+
+   // Load fiber quaternions from file
+   std::shared_ptr<GridFunction> flat_fiber_quat;
+   ecg_readGF(obj, "fibers", mesh, flat_fiber_quat);
+   std::shared_ptr<ParGridFunction> fiber_quat;
+   fiber_quat = std::make_shared<mfem::ParGridFunction>(pmesh, flat_fiber_quat.get(), pmeshpart);
+
+   
+   // Load conductivity data
+   MatrixElementPiecewiseCoefficient sigma_m_pos_coeffs(fiber_quat);
+   MatrixElementPiecewiseCoefficient sigma_m_neg_coeffs(fiber_quat);
+   for (int ii=0; ii<heartRegions.size(); ii++) {
+      int heartCursor=3*ii;
+      Vector sigma_m_vec(&sigma_m[heartCursor],3);
+      Vector sigma_m_pos_vec(3);
+      Vector sigma_m_neg_vec(3);
+      for (int jj=0; jj<3; jj++)
+      {
+         double value = sigma_m[heartCursor+jj]*dt/2/Bm/Cm;
+         sigma_m_pos_vec[jj] = value;
+         sigma_m_neg_vec[jj] = -value;
+      }
+    
+      sigma_m_pos_coeffs.heartConductivities_[heartRegions[ii]] = sigma_m_pos_vec;
+      sigma_m_neg_coeffs.heartConductivities_[heartRegions[ii]] = sigma_m_neg_vec;
+   }
+
+   // 准备求解细胞外电位
+   if (solveForUe) {
+      if (my_rank == 0) {
+         std::cout << "准备求解细胞外电位..." << std::endl;
+         
+         // 打印电导率信息
+         std::cout << "心脏区域数量: " << heartRegions.size() << std::endl;
+         std::cout << "细胞内电导率值数量: " << sigma_i_values.size() << std::endl;
+         std::cout << "细胞外电导率值数量: " << sigma_e_values.size() << std::endl;
+         
+         // 打印一些样本值
+         if (!heartRegions.empty()) {
+            std::cout << "第一个心脏区域: " << heartRegions[0] << std::endl;
+         }
+         if (sigma_i_values.size() >= 3) {
+            std::cout << "第一组细胞内电导率: " 
+                      << sigma_i_values[0] << ", " 
+                      << sigma_i_values[1] << ", " 
+                      << sigma_i_values[2] << std::endl;
+         }
+      }
+   }
+
+   StartTimer("Forming bilinear system (RHS)");
+
+   ConstantCoefficient one(1.0);
+   ParBilinearForm *b = new ParBilinearForm(pfespace);
+   b->AddDomainIntegrator(new DiffusionIntegrator(sigma_m_neg_coeffs));
+   b->AddDomainIntegrator(new MassIntegrator(one));
+   b->Assemble();
+   // This creates the linear algebra problem.
+   HypreParMatrix RHS_mat;
+   b->FormSystemMatrix(ess_tdof_list, RHS_mat);
+   EndTimer();
+
+   StartTimer("Forming bilinear system (LHS)");
+   
+   // Brought out of loop to avoid unnecessary duplication
+   ParBilinearForm *a = new ParBilinearForm(pfespace);   // defines a.
+   a->AddDomainIntegrator(new DiffusionIntegrator(sigma_m_pos_coeffs));
+   a->AddDomainIntegrator(new MassIntegrator(one));
+   a->Update(pfespace);
+   a->Assemble();
+   HypreParMatrix LHS_mat;
+   a->FormSystemMatrix(ess_tdof_list,LHS_mat);
+   EndTimer();
+
+   //Set up the solve
+   HyprePCG pcg(LHS_mat);
+   pcg.SetTol(1e-12);
+   pcg.SetMaxIter(2000);
+   pcg.SetPrintLevel(2);
+   HypreSolver *M_test = new HypreBoomerAMG(LHS_mat);
+   pcg.SetPreconditioner(*M_test);
+
+
+   //Set up the ionic models
+   ParLinearForm *c = new ParLinearForm(pfespace);
+   //positive dt here because the reaction models use dVm = -Iion
+   c->AddDomainIntegrator(new DomainLFIntegrator(stims));
+
+
+   
+   
+   ThreadServer& threadServer = ThreadServer::getInstance();
+   ThreadTeam defaultGroup = threadServer.getThreadTeam(vector<unsigned>());
+   std::vector<std::string> reactionNames;
+   reactionNames.push_back(reactionName);
+   std::vector<int> cellTypes;
+
+   //int Iion_order = 2*order+3;
+   int Iion_order = 2*order-1;
+   QuadratureSpace quadSpace(pmesh, Iion_order);
+   if (useNodalIion)
+   {
+      for (int ranklookup=local_extents[my_rank]; ranklookup<local_extents[my_rank+1]; ranklookup++)
+      {
+         cellTypes.push_back(material_from_ranklookup[ranklookup]);
+      }
+   }
+   else
+   {
+      for (int i = 0; i < pfespace->GetNE(); ++i)
+      {
+         ElementTransformation *T = pfespace->GetElementTransformation(i);
+         //This is a hack.  There's no way to get access to the offsets() array
+         //in Quadrature Space without declaring ourselves to be a friend class.
+         //This is broken and I hope it is fixed in 4.0
+         Vector localVm;
+         int NNN = quadSpace.GetElementIntRule(i).GetNPoints();
+         for ( int j=0; j<NNN; j++)
+         {
+            cellTypes.push_back(T->Attribute);
+         }
+      }
+   }
+
+   ReactionWrapper reactionWrapper(dt,reactionNames,defaultGroup,cellTypes);
+   reactionWrapper.Initialize();
+   cellTypes.clear();
+   reactionNames.clear();
+   
+   ParBilinearForm *Iion_blf;
+   HypreParMatrix Iion_mat;
+   ConstantCoefficient dt_coeff(dt);
+   ReactionFunction* rf = NULL;
+   if (useNodalIion) {
+      Iion_blf = new ParBilinearForm(pfespace);
+      Iion_blf->AddDomainIntegrator(new MassIntegrator(dt_coeff));
+      Iion_blf->Update(pfespace);
+      Iion_blf->Assemble();
+      Iion_blf->FormSystemMatrix(ess_tdof_list,Iion_mat);
+   } else {
+      Iion_blf = NULL;
+      
+      rf = new ReactionFunction(&quadSpace,pfespace,&reactionWrapper); 
+      c->AddDomainIntegrator(new QuadratureIntegrator(rf, dt)); 
+   }
+
+   Vector actual_Vm(pfespace->GetTrueVSize()), actual_b(pfespace->GetTrueVSize()), actual_old(pfespace->GetTrueVSize());
+   Vector actual_Iion(pfespace->GetTrueVSize());
+   bool first=true;
+
+   if (useNodalIion)
+   {
+      actual_Vm = reactionWrapper.getVmReadonly();
+   }
+   
+   int itime=0;
+   while (1)
+   {
+      if (my_rank == 0)
+      {
+         std::cout << "time = " << timeline.realTimeFromTimestep(itime) << std::endl;
+      }
+      //output if appropriate
+      if ((itime % timeline.timestepFromRealTime(outputRate)) == 0)
+      {
+         // 添加同步点，确保所有进程在输出前完成计算
+         MPI_Barrier(MPI_COMM_WORLD);
+         
+         if (my_rank == 0)
+         {
+            std::string timedir = outputDir + "/tm" + timeline.outputIdFromTimestep(itime);
+            recursive_mkdir(timedir); 
+
+            std::vector<double> dataBuffer(local_extents[num_ranks]);
+            for (int irank=0; irank<num_ranks; irank++)
+            {
+               int local_size = local_extents[irank+1] - local_extents[irank];
+               std::vector<double> rankBuffer(local_size);
+               if (irank==0)
+               {
+                  if (local_extents[irank+1] > 0)
+                  {
+                     //Since rank 0 is always the least, ranklookup == localvert
+                     //the following assertion makes sure this is always true.
+                     assert(ghostlocalvert_from_ranklookup[local_extents[irank+1]-1] == local_extents[irank+1]-1);
+                     memcpy(&rankBuffer[0], &gf_Vm[0], sizeof(double)*local_size);
+                  }
+               }
+               else
+               {
+                  MPI_Status dontcare;
+                  MPI_Recv(&rankBuffer[0], local_size,
+                           MPI_DOUBLE, irank, 455, MPI_COMM_WORLD, &dontcare);
+               }
+               for (int ii=0; ii<local_size; ii++)
+               {
+                  dataBuffer[globalvert_from_ranklookup[ii+local_extents[irank]]] = rankBuffer[ii];
+               }
+            }
+            std::string VmFilename = timedir + "/Vm.npy";
+            save1dNumpyArray(timedir + "/Vm.npy", dataBuffer);
+            
+            // 也输出u_e（如果我们正在求解它）
+            if (solveForUe) {
+               std::vector<double> ueDataBuffer(local_extents[num_ranks]);
+               for (int irank = 0; irank < num_ranks; irank++) {
+                  int local_size = local_extents[irank+1] - local_extents[irank];
+                  std::vector<double> rankBuffer(local_size);
+                  if (irank == 0) {
+                     if (local_extents[irank+1] > 0) {
+                        memcpy(&rankBuffer[0], &gf_ue[0], sizeof(double)*local_size);
+                     }
+                  } else {
+                     MPI_Status dontcare;
+                     MPI_Recv(&rankBuffer[0], local_size,
+                              MPI_DOUBLE, irank, 456, MPI_COMM_WORLD, &dontcare);
+                  }
+                  for (int ii = 0; ii < local_size; ii++) {
+                     ueDataBuffer[globalvert_from_ranklookup[ii+local_extents[irank]]] = rankBuffer[ii];
+                  }
+               }
+               save1dNumpyArray(timedir + "/Ue.npy", ueDataBuffer);
+            }
+         }
+         else
+         {
+            int local_size = local_extents[my_rank+1]-local_extents[my_rank];
+            std::vector<double> dataFromLocalRanklookup(local_size);
+            for (int ii=0; ii<local_size; ii++)
+            {
+               int ranklookup = local_extents[my_rank] + ii;
+               dataFromLocalRanklookup[ii] = gf_Vm[ghostlocalvert_from_ranklookup[ranklookup]];
+            }
+            MPI_Send(&dataFromLocalRanklookup[0], local_size,
+                     MPI_DOUBLE, 0, 455, MPI_COMM_WORLD);
+                     
+            // 发送u_e数据（如果我们正在求解它）
+            if (solveForUe) {
+               std::vector<double> ueDataFromLocalRanklookup(local_size);
+               for (int ii = 0; ii < local_size; ii++) {
+                  int ranklookup = local_extents[my_rank] + ii;
+                  ueDataFromLocalRanklookup[ii] = gf_ue[ghostlocalvert_from_ranklookup[ranklookup]];
+               }
+               MPI_Send(&ueDataFromLocalRanklookup[0], local_size,
+                       MPI_DOUBLE, 0, 456, MPI_COMM_WORLD);
+            }
+         }
+         
+         // 添加同步障碍，确保所有进程都完成了数据传输
+         MPI_Barrier(MPI_COMM_WORLD);
+      }
+      //if end time, then exit
+      if (itime == timeline.maxTimesteps()) { break; }
+
+      //calculate the ionic contribution.
+      if (useNodalIion) {
+         reactionWrapper.getVmReadwrite() = actual_Vm; //should be a memcpy
+         reactionWrapper.Calc();
+      } else {
+         rf->Calc(gf_Vm);
+      }
+      
+      //add stimulii
+      stims.updateTime(timeline.realTimeFromTimestep(itime));
+      
+      //compute the Iion and stimulus contribution
+      c->Update();
+      c->Assemble();
+      a->FormLinearSystem(ess_tdof_list, gf_Vm, *c, LHS_mat, actual_Vm, actual_b, 1);
+      //compute the RHS matrix contribution
+      RHS_mat.Mult(actual_Vm, actual_old);
+      actual_b += actual_old;
+
+      if (useNodalIion)
+      {
+         Iion_mat.Mult(reactionWrapper.getIionReadonly(), actual_old);
+         actual_b += actual_old;
+      }
+      //solve the matrix
+      pcg.Mult(actual_b, actual_Vm);
+
+      a->RecoverFEMSolution(actual_Vm, *c, gf_Vm);
+      
+      // 求解伪双域模型以恢复细胞外电位u_e
+      if (solveForUe) {
+          if (my_rank == 0 && itime % 10 == 0) {
+              std::cout << "求解细胞外电位(u_e)..." << std::endl;
+          }
+          
+          // 设置统一的打印级别
+          int local_print_level = (my_rank == 0 && itime % 50 == 0) ? 1 : 0;
+          int global_print_level;
+          MPI_Allreduce(&local_print_level, &global_print_level, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+          
+          try {
+              // 使用统一的打印级别求解细胞外电位
+              solvePseudoBidomainForUe(
+                  pmesh, pfespace, gf_Vm, gf_ue, 
+                  sigma_i_values, sigma_e_values, fiber_quat,
+                  ess_tdof_list, heartRegions, 
+                  global_print_level
+              );
+          } catch (const std::exception& e) {
+              // 确保所有进程都知道发生了异常
+              if (my_rank == 0) {
+                  std::cerr << "求解细胞外电位时发生错误: " << e.what() << std::endl;
+              }
+          }
+      }
+      
+      itime++;
+      first=false;
+   }
+
+   // 14. Free the used memory.
+   delete M_test;
+   delete a;
+   delete b;
+   delete c;
+   if (rf) delete rf;
+   if (Iion_blf) delete Iion_blf;
+   delete pfespace;
+   if (order > 0) { delete fec; }
+   delete mesh;
+   delete pmesh;
+   delete[] pmeshpart;
+   
+   return 0;
+}

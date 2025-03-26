@@ -11,7 +11,7 @@
 
 #include "node.hpp"
 
-namespace KDTree
+namespace KDTree_plus
 {
 
   template <typename _Tp, typename _Alloc>
@@ -78,7 +78,7 @@ namespace KDTree
       }
     };
 
-} // namespace KDTree
+} // namespace KDTree_plus
 
 #endif // include guard
 

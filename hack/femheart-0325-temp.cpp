@@ -19,7 +19,6 @@
 #include "util.hpp"
 #include "MatrixElementPiecewiseCoefficient.hpp"
 #include "cardiac_coefficients.hpp"
-#include "torsoSolver.hpp"
 
 #include <map>
 #include <unordered_set>
@@ -891,6 +890,113 @@ struct Point3D {
 
 
 
+int solveTorsoModel(
+   ParMesh* pmesh_torso,
+   ParFiniteElementSpace* pfespace_torso,
+   ParGridFunction& gf_ue_torso,
+   double sigma_T,
+   Array<int>& ess_tdof_list_torso,
+   int print_level = 2)
+{
+   int my_rank;
+   MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+   
+   if (my_rank == 0 && print_level > 0) {
+       std::cout << "求解Torso模型方程..." << std::endl;
+   }
+   
+   // 检查边界条件是否合理
+   bool boundary_valid = true;
+   double min_boundary_value = 1e10;
+   double max_boundary_value = -1e10;
+   
+   for (int i = 0; i < ess_tdof_list_torso.Size(); i++) {
+       int dof = ess_tdof_list_torso[i];
+       if (dof >= 0 && dof < gf_ue_torso.Size()) {
+           double value = gf_ue_torso(dof);
+           min_boundary_value = std::min(min_boundary_value, value);
+           max_boundary_value = std::max(max_boundary_value, value);
+           
+           if (std::isnan(value) || std::isinf(value)) {
+               boundary_valid = false;
+               break;
+           }
+       }
+   }
+   
+   if (my_rank == 0 && print_level > 0) {
+       std::cout << "  边界条件值范围: [" << min_boundary_value << ", " << max_boundary_value << "]" << std::endl;
+   }
+   
+   if (!boundary_valid) {
+       if (my_rank == 0) {
+           std::cout << "错误：边界条件无效，中止求解。" << std::endl;
+       }
+       return -1;
+   }
+   
+   // 设置常数电导率系数
+   ConstantCoefficient sigma_T_coeff(-sigma_T);  // 注意符号：Diffusion算子是-div(sigma*grad)
+   
+   // 设置双线性形式
+   ParBilinearForm *a_torso = new ParBilinearForm(pfespace_torso);
+   a_torso->AddDomainIntegrator(new DiffusionIntegrator(sigma_T_coeff));
+   a_torso->Assemble();
+   
+   // 创建零线性形式作为右侧向量（无源项）
+   ParLinearForm *f_torso = new ParLinearForm(pfespace_torso);
+   f_torso->Assemble();
+   
+   // 正确设置线性系统
+   HypreParMatrix A_torso;
+   Vector B_torso, X_torso;
+   
+   // 使用FormLinearSystem正确地构建考虑边界条件的线性系统
+   a_torso->FormLinearSystem(ess_tdof_list_torso, gf_ue_torso, *f_torso, 
+                          A_torso, X_torso, B_torso);
+   
+   if (my_rank == 0 && print_level > 1) {
+       std::cout << "  线性系统已准备完成" << std::endl;
+       std::cout << "  矩阵大小: " << A_torso.Height() << " x " << A_torso.Width() << std::endl;
+       std::cout << "  右侧向量范数: " << B_torso.Norml2() << std::endl;
+   }
+   
+   // 设置求解器
+   HyprePCG pcg_torso(A_torso);
+   pcg_torso.SetTol(1e-12);
+   pcg_torso.SetMaxIter(1000);
+   pcg_torso.SetPrintLevel(print_level > 1 ? 2 : 0);
+   
+   // 设置预处理器
+   HypreBoomerAMG amg_torso(A_torso);
+   amg_torso.SetPrintLevel(0);
+   pcg_torso.SetPreconditioner(amg_torso);
+   
+   // 求解系统
+   pcg_torso.Mult(B_torso, X_torso);
+   
+   // 获取迭代次数
+   int num_iterations = 0;
+   pcg_torso.GetNumIterations(num_iterations);
+   
+   // 检查结果是否合理
+   double min_value = X_torso.Min();
+   double max_value = X_torso.Max();
+   
+   if (my_rank == 0 && print_level > 0) {
+       std::cout << "  解的范围: [" << min_value << ", " << max_value << "]" << std::endl;
+       std::cout << "  PCG迭代次数: " << num_iterations << std::endl;
+   }
+   
+   // 将解恢复到网格函数（自动处理边界条件）
+   a_torso->RecoverFEMSolution(X_torso, *f_torso, gf_ue_torso);
+   
+   // 清理
+   delete a_torso;
+   delete f_torso;
+   
+   return num_iterations;
+}
 
 
 /**
@@ -2206,20 +2312,19 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
    }
    
    try {
-//setTorsoIntersectionBoundaryConditions(gf_ue, *gf_ue_torso, ess_tdof_list_torso);
+setTorsoIntersectionBoundaryConditions(gf_ue, *gf_ue_torso, ess_tdof_list_torso);
 
       
        
        // 设置打印级别
-       //int local_print_level = (my_rank == 0 && itime % 50 == 0) ? 2 : 1;
-       //int global_print_level;
-       //MPI_Allreduce(&local_print_level, &global_print_level, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+       int local_print_level = (my_rank == 0 && itime % 50 == 0) ? 2 : 1;
+       int global_print_level;
+       MPI_Allreduce(&local_print_level, &global_print_level, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
        
        // 求解torso模型
- //solveTorsoModel(pmesh_torso, pfespace_torso, *gf_ue_torso,
-                  //sigma_torso, ess_tdof_list_torso, global_print_level);
+ solveTorsoModel(pmesh_torso, pfespace_torso, *gf_ue_torso,
+                  sigma_torso, ess_tdof_list_torso, global_print_level);
        
-torsoSolver(mesh, torso_mesh, gf_ue, *gf_ue_torso, pfespace, pfespace_torso, sigma_torso);
 
        
        

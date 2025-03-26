@@ -11,7 +11,7 @@
 
 #include "node.hpp"
 
-namespace KDTree
+namespace KDTree_plus
 {
 
   template <size_t const __K, typename _Val, typename _SubVal,
@@ -113,7 +113,7 @@ namespace KDTree
       _Cmp _M_cmp;
     };
 
-} // namespace KDTree
+} // namespace KDTree_plus
 
 #endif // include guard
 

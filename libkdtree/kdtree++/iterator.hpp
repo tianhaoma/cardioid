@@ -11,7 +11,7 @@
 
 #include "node.hpp"
 
-namespace KDTree
+namespace KDTree_plus
 {
   template <typename _Val, typename _Ref, typename _Ptr>
     class _Iterator;
@@ -240,7 +240,7 @@ namespace KDTree
                _Iterator<_Val, const _Val&, const _Val*> const& __Y)
     { return __X._M_node != __Y._M_node; }
 
-} // namespace KDTree
+} // namespace KDTree_plus
 
 #endif // include guard
 

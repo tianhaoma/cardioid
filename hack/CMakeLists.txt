@@ -7,5 +7,6 @@ blt_add_executable(
      MatrixElementPiecewiseCoefficient.cpp
      util.cpp
      cardiac_coefficients.cpp
+     torsoSolver.cpp
      DEPENDS_ON mfem ode_gpu_aware simUtil mpi openmp
   )

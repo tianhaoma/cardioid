@@ -84,7 +84,7 @@
 #include "node.hpp"
 #include "region.hpp"
 
-namespace KDTree
+namespace KDTree_plus
 {
 
 #ifdef KDTREE_CHECK_PERFORMANCE
@@ -1235,7 +1235,7 @@ namespace KDTree
   };
 
 
-} // namespace KDTree
+} // namespace KDTree_plus
 
 #endif // include guard
 

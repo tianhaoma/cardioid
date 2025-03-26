@@ -1,0 +1,23 @@
+[ccld] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/gcc CMakeCCompilerId.c -I/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/include -pthread -L/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/lib -Wl,-rpath,/opt/ohpc/pub/compiler/gcc/8.3.0/lib/gcc/x86_64-pc-linux-gnu/8.3.0 -Wl,-rpath,/opt/ohpc/pub/compiler/gcc/8.3.0/lib64 -Wl,-rpath -Wl,/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/lib -lmpi
+[ccld] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/gcc -print-sysroot
+[ccld] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/g++ CMakeCXXCompilerId.cpp -I/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/include -pthread -L/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/lib -Wl,-rpath,/opt/ohpc/pub/compiler/gcc/8.3.0/lib/gcc/x86_64-pc-linux-gnu/8.3.0 -Wl,-rpath,/opt/ohpc/pub/compiler/gcc/8.3.0/lib64 -Wl,-rpath -Wl,/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/lib -lmpi
+[ccld] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/g++ -print-sysroot
+[ld] ld --help
+[ld] ld --help
+[vcheck] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/gcc 
+[vcheck] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/gcc 
+[ld] ld --help
+[vcheck] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/g++ 
+[vcheck] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/g++ 
+[ld] ld --help
+[vcheck] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/gcc 
+[vcheck] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/gcc 
+[ld] ld --help
+[vcheck] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/g++ 
+[vcheck] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/g++ 
+[ld] ld --help
+[cc] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/gcc -fopenmp -o CMakeFiles/cmTC_d9ac2.dir/OpenMPCheckVersion.c.o -c /home/thma/spack/var/spack/stage/spack-stage-cardioid-elecfem-n47glkjya3xyxmyu7nt6yv5z3vqgn3fe/spack-build-n47glkj/CMakeFiles/CMakeScratch/TryCompile-9FuJp7/OpenMPCheckVersion.c -I/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/include -pthread
+[ccld] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/gcc -fopenmp -rdynamic CMakeFiles/cmTC_d9ac2.dir/OpenMPCheckVersion.c.o -o cmTC_d9ac2 -I/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/include -pthread -L/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/lib -Wl,-rpath,/opt/ohpc/pub/compiler/gcc/8.3.0/lib/gcc/x86_64-pc-linux-gnu/8.3.0 -Wl,-rpath,/opt/ohpc/pub/compiler/gcc/8.3.0/lib64 -Wl,-rpath -Wl,/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/lib -lmpi
+[ld] ld --help
+[cc] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/g++ -fopenmp -o CMakeFiles/cmTC_84505.dir/OpenMPCheckVersion.cpp.o -c /home/thma/spack/var/spack/stage/spack-stage-cardioid-elecfem-n47glkjya3xyxmyu7nt6yv5z3vqgn3fe/spack-build-n47glkj/CMakeFiles/CMakeScratch/TryCompile-zGbYRJ/OpenMPCheckVersion.cpp -I/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/include -pthread
+[ccld] /opt/ohpc/pub/compiler/gcc/8.3.0/bin/g++ -fopenmp -rdynamic CMakeFiles/cmTC_84505.dir/OpenMPCheckVersion.cpp.o -o cmTC_84505 -I/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/include -pthread -L/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/lib -Wl,-rpath,/opt/ohpc/pub/compiler/gcc/8.3.0/lib/gcc/x86_64-pc-linux-gnu/8.3.0 -Wl,-rpath,/opt/ohpc/pub/compiler/gcc/8.3.0/lib64 -Wl,-rpath -Wl,/home/thma/spack/opt/spack/linux-centos7-x86_64_v3/gcc-8.3.0/openmpi-5.0.5-52a7cztp4v54tl4qiipvfx4cr7c2k5oo/lib -lmpi
