@@ -32,6 +32,146 @@
 using namespace mfem;
 
 MPI_Comm COMM_LOCAL = MPI_COMM_WORLD;
+
+
+const double DEFAULT_HEART_POTENTIAL = -83.0;  // 默认心脏电位值（仅作为备用）
+
+
+void SaveUsingParallelDataCollection(ParMesh *pmesh, ParGridFunction *pgf, const string &output_dir, const string &collection_name, int cycle, MPI_Comm comm)
+{
+    int myrank;
+    MPI_Comm_rank(comm, &myrank);
+    
+    // 创建并行数据收集对象
+    ParaViewDataCollection *pvdc = new ParaViewDataCollection(collection_name, pmesh);
+    
+    // 设置输出路径
+    pvdc->SetPrefixPath(output_dir);
+    
+    // 注册网格函数
+    pvdc->RegisterField("solution", pgf);
+    
+    // 设置当前周期和可选的物理时间
+    pvdc->SetCycle(cycle);
+    pvdc->SetTime(cycle * 0.01); // 示例时间步长
+    
+    // 保存数据
+    pvdc->Save();
+    
+    if (myrank == 0)
+    {
+        cout << "使用ParaViewDataCollection保存了解，路径: " << output_dir << "/" << collection_name << endl;
+    }
+    
+    delete pvdc;
+}
+
+// 定义边界条件类型的映射
+enum BoundaryType {
+    NEUMANN_ZERO = 1,   // 零Neumann边界(外部边界)
+    DIRICHLET = 100,    // Dirichlet边界(心脏-躯干界面)
+    SOURCE = 100        // 源边界(与Dirichlet边界相同)
+};
+
+// 边界点结构
+struct BoundaryPoint {
+    Vector coords;
+    double value;
+    
+    BoundaryPoint(const Vector& c, double v) : coords(c), value(v) {}
+};
+
+// 辅助类：基于坐标的网格函数插值器
+class CoordinateBasedTransfer {
+private:
+    ParMesh* source_mesh;
+    ParFiniteElementSpace* source_fes;
+    ParGridFunction* source_gf;
+    
+    // 用于空间查找的容忍度
+    const double spatial_tol = 1e-8;
+    
+    // 存储源网格边界点的坐标和值
+    std::vector<BoundaryPoint> boundary_points;
+
+public:
+    CoordinateBasedTransfer(ParMesh* src_mesh, ParFiniteElementSpace* src_fes, 
+                           ParGridFunction* src_gf)
+        : source_mesh(src_mesh), source_fes(src_fes), source_gf(src_gf) {
+        // 构建源网格(心脏)边界点的映射
+        BuildBoundaryPointsMap();
+    }
+
+    // 构建边界点坐标-值映射
+    void BuildBoundaryPointsMap() {
+        // 获取源网格的所有边界顶点
+        for (int i = 0; i < source_mesh->GetNBE(); i++) {
+            Array<int> vertices;
+            source_mesh->GetBdrElementVertices(i, vertices);
+            
+            // 对于每个顶点
+            for (int j = 0; j < vertices.Size(); j++) {
+                int vdof = vertices[j];
+                
+                // 获取顶点坐标
+                Vector coords(3);
+                source_mesh->GetNode(vdof, coords);
+                
+                // 获取该顶点处的值
+                // 注意：我们使用vdof作为索引获取值（与顶点一一对应）
+                double value = (*source_gf)(vdof);
+                
+                // 存储到向量中
+                boundary_points.emplace_back(coords, value);
+            }
+        }
+    }
+
+    // 获取目标点的值
+    double GetValueAtPoint(const Vector& point) {
+        // 查找最近的点
+        double min_dist = std::numeric_limits<double>::max();
+        double closest_value = DEFAULT_HEART_POTENTIAL;
+        
+        for (const auto& bp : boundary_points) {
+            double dist = 0.0;
+            for (int i = 0; i < 3; i++) {
+                dist += (bp.coords(i) - point(i)) * (bp.coords(i) - point(i));
+            }
+            dist = sqrt(dist);
+            
+            if (dist < min_dist) {
+                min_dist = dist;
+                closest_value = bp.value;
+                
+                // 如果距离小于容差，立即返回
+                if (dist < spatial_tol) {
+                    return closest_value;
+                }
+            }
+        }
+        
+        // 返回最近点的值
+        return closest_value;
+    }
+};
+
+// 用于设置边界值的系数函数
+class BoundaryValuesCoefficient : public Coefficient {
+private:
+    CoordinateBasedTransfer* transfer;
+    
+public:
+    BoundaryValuesCoefficient(CoordinateBasedTransfer* t) : transfer(t) {}
+    
+    virtual double Eval(ElementTransformation& T, const IntegrationPoint& ip) {
+        Vector physical_coord(3);
+        T.Transform(ip, physical_coord);
+        return transfer->GetValueAtPoint(physical_coord);
+    }
+};
+
+
 /**
  * 改进版边界相交识别和条件设置
  * 使用精确的几何条件和距离检查来识别真正的交界面点
@@ -1059,7 +1199,8 @@ int solvePseudoBidomainForUe(
     if (my_rank == 0) std::cout << "[4/8] 检查相容性条件..." << std::endl;
     
     double compat_start_time = MPI_Wtime();
-    
+
+    #if 0
     if (enforce_zero_mean && ess_tdof_list.Size() == 0) {
         if (my_rank == 0 && print_level > 0) {
             std::cout << "纯Neumann问题检测到，执行相容性条件检查..." << std::endl;
@@ -1112,8 +1253,9 @@ int solvePseudoBidomainForUe(
                 }
                 
                 double new_global_sum = 0.0;
+                MPI_Barrier(MPI_COMM_WORLD);
                 MPI_Allreduce(&new_local_sum, &new_global_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-                
+                MPI_Barrier(MPI_COMM_WORLD);
                 std::cout << "调整后右侧项积分值: " << new_global_sum << std::endl;
             }
         } else {
@@ -1131,6 +1273,87 @@ int solvePseudoBidomainForUe(
             }
         }
     }
+    #endif
+    if (enforce_zero_mean && ess_tdof_list.Size() == 0) {
+        // 只有rank 0输出
+        if (my_rank == 0 && print_level > 0) {
+            std::cout << "纯Neumann问题检测到，执行相容性条件检查..." << std::endl;
+        }
+        
+        // 所有进程执行的代码
+        ParGridFunction ones(pfespace);
+        ones = 1.0;
+        
+        Vector ones_true(pfespace->GetTrueVSize());
+        ones.GetTrueDofs(ones_true);
+        
+        double local_rhs_sum = 0.0;
+        for (int i = 0; i < rhs.Size(); i++) {
+            local_rhs_sum += rhs(i);
+        }
+        
+        double global_rhs_sum = 0.0;
+        MPI_Allreduce(&local_rhs_sum, &global_rhs_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        
+        double local_count = rhs.Size();
+        double global_count = 0.0;
+        MPI_Allreduce(&local_count, &global_count, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        
+        // 只有rank 0输出
+        if (my_rank == 0 && print_level > 0) {
+            std::cout << "右侧项积分值: " << global_rhs_sum << std::endl;
+            std::cout << "自由度总数: " << global_count << std::endl;
+        }
+        
+        if (fabs(global_rhs_sum) > 1e-10) {
+            // 只有rank 0输出
+            if (my_rank == 0 && print_level > 0) {
+                std::cout << "相容性条件不满足，调整右侧项..." << std::endl;
+            }
+            
+            double correction = global_rhs_sum / global_count;
+            for (int i = 0; i < rhs.Size(); i++) {
+                rhs(i) -= correction;
+            }
+            
+            // 所有进程重新计算局部和
+            double new_local_sum = 0.0;
+            for (int i = 0; i < rhs.Size(); i++) {
+                new_local_sum += rhs(i);
+            }
+            
+            // 所有进程都参与的集体通信
+            double new_global_sum = 0.0;
+            MPI_Barrier(MPI_COMM_WORLD);
+            MPI_Allreduce(&new_local_sum, &new_global_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Barrier(MPI_COMM_WORLD);
+            
+            // 只有rank 0输出结果
+            if (my_rank == 0 && print_level > 0) {
+                std::cout << "已调整右侧向量，每个元素减去: " << correction << std::endl;
+                std::cout << "调整后右侧项积分值: " << new_global_sum << std::endl;
+            }
+        } else {
+            // 只有rank 0输出
+            if (my_rank == 0 && print_level > 0) {
+                std::cout << "相容性条件已满足，无需调整。" << std::endl;
+            }
+        }
+    } else {
+        // 只有rank 0输出
+        if (my_rank == 0 && print_level > 0) {
+            if (ess_tdof_list.Size() > 0) {
+                std::cout << "存在Dirichlet边界条件，跳过相容性检查。" << std::endl;
+                std::cout << "Dirichlet边界点数量: " << ess_tdof_list.Size() << std::endl;
+            } else {
+                std::cout << "未启用均值为零约束，跳过相容性检查。" << std::endl;
+            }
+        }
+    }
+
+
+
+
     
     double compat_end_time = MPI_Wtime();
     if (my_rank == 0 && print_level > 0) {
@@ -1188,16 +1411,16 @@ int solvePseudoBidomainForUe(
     
     // 设置求解器
     HyprePCG pcg(A);
-    pcg.SetTol(1e-12);       // 容差
-    pcg.SetAbsTol(1e-14);    // 绝对容差
-    pcg.SetMaxIter(2000);    // 最大迭代次数
+    pcg.SetTol(1e-8);       // 容差
+    pcg.SetAbsTol(1e-8);    // 绝对容差
+    pcg.SetMaxIter(1000);    // 最大迭代次数
     
     // 设置求解器打印级别
     // 0 = 无输出, 1 = 仅最终结果, 2 = 每次迭代, 3 = 详细信息
     int pcg_print_level = 0;
     if (print_level > 1) pcg_print_level = 2;  // 显示迭代过程
     if (print_level > 2) pcg_print_level = 3;  // 显示详细信息
-    pcg.SetPrintLevel(pcg_print_level);
+    pcg.SetPrintLevel(3);
     
     // 配置预处理器
     if (my_rank == 0 && print_level > 0) {
@@ -1784,59 +2007,7 @@ int main(int argc, char *argv[])
       pfespace->GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
    }
 
-   if (solve_torso_model && !torso_mesh_file.empty()) {
-      if (my_rank == 0) {
-          std::cout << "\n===== 设置Torso模型 =====\n" << std::endl;
-          std::cout << "Torso网格文件: " << torso_mesh_file << std::endl;
-          std::cout << "Torso电导率: " << sigma_torso << " mS/mm" << std::endl;
-          std::cout << "点匹配容差: " << tolerance << std::endl;
-      }
-      
-      // 使用改进的函数读取torso网格并识别边界
-      torso_mesh = readTorsoMeshAndIdentifyBoundary(
-          torso_mesh_file, mesh, heart_boundary_marker, tolerance);
-      
-      if (my_rank == 0) {
-          std::cout << "Torso网格准备完成，进行分区..." << std::endl;
-      }
-      
-      // 分区torso网格
-      int* ptorso_meshpart = torso_mesh->GeneratePartitioning(num_ranks);
-      pmesh_torso = new ParMesh(MPI_COMM_WORLD, *torso_mesh, ptorso_meshpart);
-      
-      if (my_rank == 0) {
-          std::cout << "创建Torso有限元空间..." << std::endl;
-      }
-      
-      // 为torso创建有限元空间，与heart使用相同的有限元类型
-      pfespace_torso = new ParFiniteElementSpace(pmesh_torso, fec);
-      
-      if (my_rank == 0) {
-          std::cout << "Torso有限元空间创建完成，自由度数量: " << pfespace_torso->GetTrueVSize() << std::endl;
-      }
-      
-
-
-      
-      // 创建torso解向量
-      gf_ue_torso = new ParGridFunction(pfespace_torso);
-      *gf_ue_torso = 0.0;
-      
-      // 释放临时内存
-      delete[] ptorso_meshpart;
-      
-      if (my_rank == 0) {
-          std::cout << "\n===== Torso模型设置完成 =====\n" << std::endl;
-      }
-  } else {
-      if (my_rank == 0) {
-          if (!solve_torso_model) {
-              std::cout << "Torso模型求解被禁用。" << std::endl;
-          } else if (torso_mesh_file.empty()) {
-              std::cout << "未提供Torso网格文件，跳过Torso模型设置。" << std::endl;
-          }
-      }
-  }
+   
 
 
 
@@ -1850,6 +2021,85 @@ int main(int argc, char *argv[])
    gf_Vm = initVm;
    gf_ue = 0.0;  // 初始化为零
    gf_b = 0.0;
+
+
+
+   //if (solve_torso_model && !torso_mesh_file.empty()) 
+    if (my_rank == 0) {
+        std::cout << "\n===== 设置Torso模型 =====\n" << std::endl;
+        std::cout << "Torso网格文件: " << torso_mesh_file << std::endl;
+        std::cout << "Torso电导率: " << sigma_torso << " mS/mm" << std::endl;
+        std::cout << "点匹配容差: " << tolerance << std::endl;
+    }
+    
+    // 使用改进的函数读取torso网格并识别边界
+    torso_mesh = new Mesh(torso_mesh_file, 1, 1);
+
+            // 设置躯干网格的边界属性
+            for (int i = 0; i < torso_mesh->GetNBE(); i++) {
+              int bid = torso_mesh->GetBdrAttribute(i);
+              if (bid == 1) {
+                  torso_mesh->SetBdrAttribute(i, BoundaryType::NEUMANN_ZERO);
+              } else if (bid == 100) {
+                  torso_mesh->SetBdrAttribute(i, BoundaryType::DIRICHLET);
+              }
+          }
+    
+    if (my_rank == 0) {
+        std::cout << "Torso网格准备完成，进行分区..." << std::endl;
+    }
+    
+    // 分区torso网格
+    int* ptorso_meshpart = torso_mesh->GeneratePartitioning(num_ranks);
+    pmesh_torso = new ParMesh(MPI_COMM_WORLD, *torso_mesh, ptorso_meshpart);
+
+  // 3. 创建网格值传输器
+  CoordinateBasedTransfer* transfer = 
+  new CoordinateBasedTransfer(pmesh, pfespace, &gf_ue);
+        
+    
+    if (my_rank == 0) {
+        std::cout << "创建Torso有限元空间..." << std::endl;
+    }
+    
+    // 为torso创建有限元空间，与heart使用相同的有限元类型
+    FiniteElementCollection* torso_fec = new H1_FECollection(1, 3);
+    pfespace_torso = new ParFiniteElementSpace(pmesh_torso, torso_fec);
+
+    
+    if (my_rank == 0) {
+        std::cout << "Torso有限元空间创建完成，自由度数量: " << pfespace_torso->GetTrueVSize() << std::endl;
+    }
+    
+
+
+    
+    // 创建torso解向量
+    gf_ue_torso = new ParGridFunction(pfespace_torso);
+    *gf_ue_torso = 0.0;
+    
+    // 释放临时内存
+    delete[] ptorso_meshpart;
+    
+    if (my_rank == 0) {
+        std::cout << "\n===== Torso模型设置完成 =====\n" << std::endl;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
    // Load fiber quaternions from file
    std::shared_ptr<GridFunction> flat_fiber_quat;
@@ -2015,26 +2265,30 @@ int main(int argc, char *argv[])
    }
 
 
-Array<int> ess_tdof_list_torso;
-if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_torso) {
-    if (my_rank == 0) {
-        std::cout << "\n===== 准备心脏-躯干交界面 =====\n" << std::endl;
-    }
-    
-    // 预先计算交界面DOF列表
-    ess_tdof_list_torso = setupIntersectionBoundary(
-        gf_ue, *gf_ue_torso, mesh, torso_mesh, pfespace_torso, tolerance);
-    
-    if (my_rank == 0) {
-        std::cout << "找到 " << ess_tdof_list_torso.Size() << " 个交界面DOF" << std::endl;
-        std::cout << "\n===== 心脏-躯干交界面准备完成 =====\n" << std::endl;
-    }
-}
 
 
 
+        // 5. 创建双线性型和线性型
+        ParBilinearForm* a_torsoSolver = new ParBilinearForm(pfespace_torso);
+        ConstantCoefficient sigma_torso_coeff(sigma_torso);
+        a_torsoSolver->AddDomainIntegrator(new DiffusionIntegrator(sigma_torso_coeff));
+        a_torsoSolver->Assemble();
+        a_torsoSolver->Finalize();
 
-
+        // 创建线性型
+        ParLinearForm* b_torsoSolver = new ParLinearForm(pfespace_torso);
+                // 为源边界创建边界属性数组
+                Array<int> source_bdr_torso(pmesh_torso->bdr_attributes.Max());
+                source_bdr_torso = 0;
+                source_bdr_torso[BoundaryType::SOURCE-1] = 1;
+        // 6. 应用Dirichlet边界条件
+        Array<int> ess_bdr_torso(pmesh_torso->bdr_attributes.Max());
+        ess_bdr_torso = 0;
+        ess_bdr_torso[BoundaryType::DIRICHLET-1] = 1; 
+            Array<int> ess_tdof_list_torso;
+        pfespace_torso->GetEssentialTrueDofs(ess_bdr_torso, ess_tdof_list_torso);
+// 创建包含边界值的系数函数
+BoundaryValuesCoefficient* bdr_coef = new BoundaryValuesCoefficient(transfer); 
 
    
    int itime=0;
@@ -2105,13 +2359,13 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
                }
                save1dNumpyArray(timedir + "/Ue.npy", ueDataBuffer);
                int valid_values = 0;
-for (int i = 0; i < ueDataBuffer.size(); i++) {
-  if (fabs(ueDataBuffer[i]) > 1e-10) valid_values++;
-}
-std::cout << "有效ueDataBuffer电势值节点数: " << valid_values << " 总节点数: " << ueDataBuffer.size() << std::endl;
-
-
+            for (int i = 0; i < ueDataBuffer.size(); i++) {
+                if (fabs(ueDataBuffer[i]) > 1e-10) valid_values++;
+                }
+            std::cout << "有效ueDataBuffer电势值节点数: " << valid_values << " 总节点数: " << ueDataBuffer.size() << std::endl;
             }
+
+
          }
          else
          {
@@ -2206,6 +2460,25 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
    }
    
    try {
+
+    // 释放旧的传输器
+    if (transfer) {
+        delete transfer;
+        transfer = nullptr;
+    }
+    if (bdr_coef) {
+        delete bdr_coef;
+        bdr_coef = nullptr;
+    }
+    
+    // 创建新的传输器，使用最新的心脏解
+    transfer = new CoordinateBasedTransfer(pmesh, pfespace, &gf_ue);
+    bdr_coef = new BoundaryValuesCoefficient(transfer);
+
+
+
+
+    
 //setTorsoIntersectionBoundaryConditions(gf_ue, *gf_ue_torso, ess_tdof_list_torso);
 
       
@@ -2219,11 +2492,67 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
  //solveTorsoModel(pmesh_torso, pfespace_torso, *gf_ue_torso,
                   //sigma_torso, ess_tdof_list_torso, global_print_level);
        
-torsoSolver(mesh, torso_mesh, gf_ue, *gf_ue_torso, pfespace, pfespace_torso, sigma_torso);
+//torsoSolver(mesh, torso_mesh, gf_ue, *gf_ue_torso, pfespace, pfespace_torso, sigma_torso);
+// 求解torso模型
 
-       
-       
 
+   
+        
+//delete b_torsoSolver;
+//b_torsoSolver = new ParLinearForm(pfespace_torso);
+                // 在源边界上添加边界积分
+    //ConstantCoefficient source_coeff(1.0);
+    //b_torsoSolver->AddBoundaryIntegrator(new BoundaryLFIntegrator(source_coeff),
+                                    //source_bdr_torso);
+    b_torsoSolver->Assemble();
+
+
+
+        // 应用边界条件 - 仅在Dirichlet边界上使用心脏网格的值
+        gf_ue_torso->ProjectBdrCoefficient(*bdr_coef, ess_bdr_torso);
+
+        
+
+        // 7. 求解线性系统
+        OperatorPtr A_torsoSolver;
+        Vector B_torsoSolver, X_torsoSolver;
+        a_torsoSolver->FormLinearSystem(ess_tdof_list_torso,
+             *gf_ue_torso, *b_torsoSolver, 
+             A_torsoSolver, X_torsoSolver, B_torsoSolver);
+        
+        // 设置求解器
+        HypreBoomerAMG* precond_torsoSolver = new HypreBoomerAMG;
+        HyprePCG* pcg_torsoSolver = new HyprePCG(MPI_COMM_WORLD);
+        
+        HypreParMatrix* parcsr_A = A_torsoSolver.As<HypreParMatrix>();
+        
+        precond_torsoSolver->SetPrintLevel(0);
+        pcg_torsoSolver->SetPreconditioner(*precond_torsoSolver);
+        pcg_torsoSolver->SetOperator(*parcsr_A);
+        pcg_torsoSolver->SetTol(1e-12);
+        pcg_torsoSolver->SetMaxIter(1000);
+        pcg_torsoSolver->SetPrintLevel(1);
+        
+        // 求解线性系统
+        pcg_torsoSolver->Mult(B_torsoSolver, X_torsoSolver);
+        
+        // 8. 恢复解
+        a_torsoSolver->RecoverFEMSolution(X_torsoSolver, *b_torsoSolver, *gf_ue_torso);
+
+
+        if (itime % timeline.timestepFromRealTime(outputRate) == 0) {
+        std::string timedir = outputDir + "/tm" + timeline.outputIdFromTimestep(itime);
+        string collection_name = "/torso_solution";
+        SaveUsingParallelDataCollection(pmesh_torso, gf_ue_torso,
+            timedir, collection_name, 0, MPI_COMM_WORLD);
+            }
+
+
+
+
+
+
+#if 0
        // 可选：输出torso解为VTK文件以便可视化
        if (itime % timeline.timestepFromRealTime(outputRate) == 0) {
            std::string timedir = outputDir + "/tm" + timeline.outputIdFromTimestep(itime);
@@ -2246,6 +2575,9 @@ torsoSolver(mesh, torso_mesh, gf_ue, *gf_ue_torso, pfespace, pfespace_torso, sig
                }
            }
        }
+#endif
+
+
    } catch (const std::exception& e) {
        if (my_rank == 0) {
            std::cerr << "处理Torso模型时发生异常: " << e.what() << std::endl;

@@ -8,6 +8,18 @@
 #define RESET "\033[0m"
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 int torsoSolver(
     Mesh* heart_mesh,
     Mesh* torso_mesh,
@@ -316,7 +328,7 @@ int torsoSolver(
 
 
 
-
+#if 0
 int solveTorsoModel(
     ParMesh* pmesh_torso,
     ParFiniteElementSpace* pfespace_torso,
@@ -424,4 +436,4 @@ int solveTorsoModel(
     
     return num_iterations;
  }
- 
+ #endif
