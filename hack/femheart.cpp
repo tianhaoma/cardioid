@@ -26,6 +26,9 @@
 #include <algorithm>
 #include <cmath>
 
+#include <mpi.h> // Include MPI header
+#include <iomanip> // For formatted output
+
 #define StartTimer(x)
 #define EndTimer()
 
@@ -1059,11 +1062,14 @@ int solvePseudoBidomainForUe(
     Array<int>& ess_tdof_list,
     const std::vector<int>& heartRegions,
     bool enforce_zero_mean = true,
-    int print_level = 2)
+    int print_level = 2,
+    double* t_ksp2_total = nullptr)
 {
     int my_rank = 0, num_procs = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+
+
     
     // 计时开始
     double start_time = MPI_Wtime();
@@ -1464,7 +1470,12 @@ amg.SetCycleNumSweeps(prerelax_sweeps, postrelax_sweeps);
     X = 0.0;  // 初始猜测为零
     
     // 执行求解
-    pcg.Mult(rhs, X);
+ double t_ksp2_start = MPI_Wtime();
+pcg.Mult(rhs, X);
+double t_ksp2_end = MPI_Wtime();
+if (t_ksp2_total != nullptr) {
+    *t_ksp2_total += (t_ksp2_end - t_ksp2_start);
+}
     
     double solve_end_time = MPI_Wtime();
     
@@ -1717,6 +1728,23 @@ int main(int argc, char *argv[])
 
    units_internal(1e-3, 1e-9, 1e-3, 1e-3, 1, 1e-9, 1);
    units_external(1e-3, 1e-9, 1e-3, 1e-3, 1, 1e-9, 1);
+
+       // --- Timer Variable Declarations ---
+    double t_start, t_end; // Temporary start/end times
+    double t_total_elapsed = 0.0;
+    double t_total = 0.0;
+    double t_problem1_total = 0.0; // e.g., Heart Solve
+    double t_problem2_total = 0.0; // e.g., BC Transfer
+    double t_problem3_total = 0.0; // e.g., Torso Solve
+    double t_ksp1_total = 0.0;     // e.g., Heart KSP
+    double t_ksp2_total = 0.0;     // e.g., Torso KSP
+    double t_ksp3_total = 0.0;     // e.g., Other KSP (if applicable)
+    double t_ionic_model_total = 0.0;
+    double t_ionic_start, t_ksp1_start, t_ksp2_start, t_ksp3_start;
+    double t_ionic_end, t_ksp1_end, t_ksp2_end, t_ksp3_end;
+
+
+
 
    if (my_rank == 0)
    {
@@ -2161,6 +2189,7 @@ int main(int argc, char *argv[])
 
    StartTimer("Forming bilinear system (RHS)");
 
+
    ConstantCoefficient one(1.0);
    ParBilinearForm *b = new ParBilinearForm(pfespace);
    b->AddDomainIntegrator(new DiffusionIntegrator(sigma_m_neg_coeffs));
@@ -2290,6 +2319,12 @@ int main(int argc, char *argv[])
 // 创建包含边界值的系数函数
 BoundaryValuesCoefficient* bdr_coef = new BoundaryValuesCoefficient(transfer); 
 
+
+    MPI_Barrier(MPI_COMM_WORLD); // Sync before starting overall timer
+    t_start = MPI_Wtime();
+    t_total_elapsed = t_start; // Store start time here initially
+double t_total_start;
+double t_total_end;
    
    int itime=0;
    while (1)
@@ -2397,6 +2432,11 @@ BoundaryValuesCoefficient* bdr_coef = new BoundaryValuesCoefficient(transfer);
       //if end time, then exit
       if (itime == timeline.maxTimesteps()) { break; }
 
+
+t_total_start = MPI_Wtime();
+
+
+t_ionic_start = MPI_Wtime();
       //calculate the ionic contribution.
       if (useNodalIion) {
          reactionWrapper.getVmReadwrite() = actual_Vm; //should be a memcpy
@@ -2404,6 +2444,8 @@ BoundaryValuesCoefficient* bdr_coef = new BoundaryValuesCoefficient(transfer);
       } else {
          rf->Calc(gf_Vm);
       }
+ t_ionic_end = MPI_Wtime();
+    t_ionic_model_total += (t_ionic_end - t_ionic_start);
       
       //add stimulii
       stims.updateTime(timeline.realTimeFromTimestep(itime));
@@ -2422,7 +2464,10 @@ BoundaryValuesCoefficient* bdr_coef = new BoundaryValuesCoefficient(transfer);
          actual_b += actual_old;
       }
       //solve the matrix
+      t_ksp1_start = MPI_Wtime();
       pcg.Mult(actual_b, actual_Vm);
+      t_ksp1_end = MPI_Wtime();
+      t_ksp1_total += (t_ksp1_end - t_ksp1_start);
 
       a->RecoverFEMSolution(actual_Vm, *c, gf_Vm);
       
@@ -2443,7 +2488,7 @@ BoundaryValuesCoefficient* bdr_coef = new BoundaryValuesCoefficient(transfer);
                   pmesh, pfespace, gf_Vm, gf_ue, 
                   sigma_i_values, sigma_e_values, fiber_quat, sheet_quat, transverse_quat,
                   ess_tdof_list, heartRegions, true,
-                  global_print_level
+                  global_print_level, &t_ksp2_total
               );
           } catch (const std::exception& e) {
               // 确保所有进程都知道发生了异常
@@ -2534,10 +2579,21 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
         pcg_torsoSolver->SetPrintLevel(1);
         
         // 求解线性系统
+        t_ksp3_start = MPI_Wtime();
         pcg_torsoSolver->Mult(B_torsoSolver, X_torsoSolver);
+      t_ksp3_end = MPI_Wtime();
+      t_ksp3_total += (t_ksp3_end - t_ksp3_start);
         
         // 8. 恢复解
         a_torsoSolver->RecoverFEMSolution(X_torsoSolver, *b_torsoSolver, *gf_ue_torso);
+
+ t_total_end = MPI_Wtime();
+    t_total += (t_total_end - t_total_start);
+
+
+
+
+
 
 
         if (itime % timeline.timestepFromRealTime(outputRate) == 0) {
@@ -2594,6 +2650,72 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
       itime++;
       first=false;
    }
+
+
+
+    MPI_Barrier(MPI_COMM_WORLD); // Sync before stopping overall timer
+    t_end = MPI_Wtime();
+    t_total_elapsed = t_end - t_total_elapsed; // Calculate total duration
+
+
+
+    double t_total_max;//, t_problem1_max, t_problem2_max, t_problem3_max;
+    double t_ksp1_max, t_ksp2_max, t_ksp3_max, t_ionic_model_max;
+
+    MPI_Reduce(&t_total_elapsed, &t_total_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    //MPI_Reduce(&t_problem1_total, &t_problem1_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    //MPI_Reduce(&t_problem2_total, &t_problem2_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    //MPI_Reduce(&t_problem3_total, &t_problem3_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&t_ksp1_total, &t_ksp1_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&t_ksp2_total, &t_ksp2_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&t_ksp3_total, &t_ksp3_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD); // Remember this is placeholder
+    MPI_Reduce(&t_ionic_model_total, &t_ionic_model_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+
+
+
+
+    if (my_rank == 0) {
+        std::cout << "\n--- Parallel Timing Results (Max Across " << num_ranks << " Ranks) ---" << std::endl;
+        std::cout << std::fixed << std::setprecision(6); // Format output
+        std::cout << "Total Simulation Time: " << t_total_max << " s" << std::endl;
+        std::cout << "--------------------------------------------------" << std::endl;
+        //std::cout << "Problem 1 (e.g., Heart): " << t_problem1_max << " s" << std::endl;
+        //std::cout << "Problem 2 (e.g., BC Tx): " << t_problem2_max << " s" << std::endl;
+        //std::cout << "Problem 3 (e.g., Torso): " << t_problem3_max << " s" << std::endl;
+        std::cout << "--------------------------------------------------" << std::endl;
+        std::cout << "KSP 1 (e.g., Heart LinSolv): " << t_ksp1_max << " s" << std::endl;
+        std::cout << "KSP 2 (e.g., Torso LinSolv): " << t_ksp2_max << " s" << std::endl;
+        std::cout << "KSP 3 (e.g., Other LinSolv): " << t_ksp3_max << " s" << std::endl; // Adjust name
+        std::cout << "--------------------------------------------------" << std::endl;
+        std::cout << "Ionic Model Calculation:     " << t_ionic_model_max << " s" << std::endl;
+        std::cout << "--------------------------------------------------" << std::endl;
+
+        // Optional: Calculate percentage of total time
+        if (t_total_max > 1e-9) { // Avoid division by zero
+           double ksp_total_max = t_ksp1_max + t_ksp2_max + t_ksp3_max;
+           //double problem_sum_max = t_problem1_max + t_problem2_max + t_problem3_max;
+           std::cout << "\n--- Percentage of Total Time (Max) ---" << std::endl;
+           //std::cout << "Problem 1: " << (t_problem1_max / t_total_max) * 100.0 << "%" << std::endl;
+           //std::cout << "Problem 2: " << (t_problem2_max / t_total_max) * 100.0 << "%" << std::endl;
+           //std::cout << "Problem 3: " << (t_problem3_max / t_total_max) * 100.0 << "%" << std::endl;
+           std::cout << "Ionic Model: " << (t_ionic_model_max / t_total_max) * 100.0 << "%" << std::endl;
+           std::cout << "Total KSP: " << (ksp_total_max / t_total_max) * 100.0 << "%" << std::endl;
+           std::cout << "--------------------------------------------------" << std::endl;
+           // Note: Sum of percentages might not be 100% due to overhead not timed
+           //       and KSP/Ionic times being *part of* Problem times.
+           //std::cout << "Debug: Sum of Problems: " << problem_sum_max << " s" << std::endl;
+           //std::cout << "Debug: KSP1 within Problem1: " << (t_ksp1_max / t_problem1_max) * 100.0 << "%" << std::endl;
+           //std::cout << "Debug: Ionic within Problem1: " << (t_ionic_model_max / t_problem1_max) * 100.0 << "%" << std::endl;
+           //std::cout << "Debug: KSP2 within Problem3: " << (t_ksp2_max / t_problem3_max) * 100.0 << "%" << std::endl;
+
+        }
+    }
+
+
+
+
+
 
    // 14. Free the used memory.
    delete M_test;
