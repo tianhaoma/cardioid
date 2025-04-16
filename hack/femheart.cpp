@@ -1741,7 +1741,7 @@ int main(int argc, char *argv[])
     double t_ksp3_total = 0.0;     // e.g., Other KSP (if applicable)
     double t_ionic_model_total = 0.0;
     double t_ionic_start, t_ksp1_start, t_ksp2_start, t_ksp3_start;
-    double t_ionic_end, t_ksp1_end, t_ksp2_end, t_ksp3_end;
+    double t_ionic_end, t_ksp1_end, t_ksp2_end, t_ksp3_end; 
 
 
 
@@ -2080,6 +2080,10 @@ int main(int argc, char *argv[])
     // 分区torso网格
     int* ptorso_meshpart = torso_mesh->GeneratePartitioning(num_ranks);
     pmesh_torso = new ParMesh(MPI_COMM_WORLD, *torso_mesh, ptorso_meshpart);
+    delete torso_mesh;
+        // 释放临时内存
+    delete[] ptorso_meshpart;
+
 
   // 3. 创建网格值传输器
   CoordinateBasedTransfer* transfer = 
@@ -2106,8 +2110,7 @@ int main(int argc, char *argv[])
     gf_ue_torso = new ParGridFunction(pfespace_torso);
     *gf_ue_torso = 0.0;
     
-    // 释放临时内存
-    delete[] ptorso_meshpart;
+
     
     if (my_rank == 0) {
         std::cout << "\n===== Torso模型设置完成 =====\n" << std::endl;
@@ -2499,7 +2502,7 @@ t_ionic_start = MPI_Wtime();
       }
       
 // 在时间迭代循环中，找到求解伪双域模型的部分后面
-if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_torso) {
+if (solve_torso_model  && pmesh_torso && pfespace_torso && gf_ue_torso) {
    if (my_rank == 0 && itime % 10 == 0) {
        std::cout << "\n===== 求解Torso模型 =====\n" << std::endl;
    }
@@ -2590,7 +2593,8 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
  t_total_end = MPI_Wtime();
     t_total += (t_total_end - t_total_start);
 
-
+delete pcg_torsoSolver;
+delete precond_torsoSolver;
 
 
 
@@ -2643,6 +2647,8 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
    if (my_rank == 0 && itime % 10 == 0) {
        std::cout << "\n===== Torso模型处理完成 =====\n" << std::endl;
    }
+
+
 }
 
 
@@ -2734,6 +2740,13 @@ if (solve_torso_model && torso_mesh && pmesh_torso && pfespace_torso && gf_ue_to
     if (pfespace_torso) delete pfespace_torso;
     if (pmesh_torso) delete pmesh_torso;
     if (torso_mesh) delete torso_mesh;
+    // 主函数末尾资源清理部分应该还需要添加：
+if (transfer) delete transfer;
+if (bdr_coef) delete bdr_coef;
+delete torso_fec; // 此行未出现在清理代码中
+
+if (a_torsoSolver) delete a_torsoSolver;
+if (b_torsoSolver) delete b_torsoSolver;
    
    return 0;
 }
