@@ -1202,7 +1202,7 @@ int solvePseudoBidomainForUe(
     }
     
     // 4. 检查相容性条件
-    if (my_rank == 0) std::cout << "[4/8] 检查相容性条件..." << std::endl;
+    //if (my_rank == 0) std::cout << "[4/8] 检查相容性条件..." << std::endl;
     
     double compat_start_time = MPI_Wtime();
 
@@ -1238,7 +1238,8 @@ int solvePseudoBidomainForUe(
             std::cout << "自由度总数: " << global_count << std::endl;
         }
         
-        if (fabs(global_rhs_sum) > 1e-10) {
+        //if (fabs(global_rhs_sum) > 1e-10) {
+        if (0){
             if (my_rank == 0 && print_level > 0) {
                 std::cout << "相容性条件不满足，调整右侧项..." << std::endl;
             }
@@ -1266,7 +1267,8 @@ int solvePseudoBidomainForUe(
             }
         } else {
             if (my_rank == 0 && print_level > 0) {
-                std::cout << "相容性条件已满足，无需调整。" << std::endl;
+                //std::cout << "相容性条件已满足，无需调整。" << std::endl;
+                std::cout << "不调整rhs。" << std::endl;
             }
         }
     } else {
@@ -1311,7 +1313,8 @@ int solvePseudoBidomainForUe(
             std::cout << "自由度总数: " << global_count << std::endl;
         }
         
-        if (fabs(global_rhs_sum) > 1e-10) {
+        //if (fabs(global_rhs_sum) > 1e-10) {
+        if (0){
             // 只有rank 0输出
             if (my_rank == 0 && print_level > 0) {
                 std::cout << "相容性条件不满足，调整右侧项..." << std::endl;
@@ -1342,7 +1345,8 @@ int solvePseudoBidomainForUe(
         } else {
             // 只有rank 0输出
             if (my_rank == 0 && print_level > 0) {
-                std::cout << "相容性条件已满足，无需调整。" << std::endl;
+                //std::cout << "相容性条件已满足，无需调整。" << std::endl;
+                std::cout << "不调整rhs。" << std::endl;
             }
         }
     } else {
