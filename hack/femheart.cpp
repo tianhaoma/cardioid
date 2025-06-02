@@ -40,6 +40,203 @@ MPI_Comm COMM_LOCAL = MPI_COMM_WORLD;
 const double DEFAULT_HEART_POTENTIAL = -83.0;  // 默认心脏电位值（仅作为备用）
 
 
+
+
+// 改进的CoordinateBasedTransfer类
+class ParallelCoordinateBasedTransfer {
+private:
+    ParMesh* source_mesh;
+    ParFiniteElementSpace* source_fes;
+    ParGridFunction* source_gf;
+    
+    const double spatial_tol = 1e-8;
+    
+    // 存储全局边界点信息
+    struct GlobalBoundaryPoint {
+        double coords[3];
+        double value;
+        int owner_rank;  // 拥有该点的进程
+        
+        GlobalBoundaryPoint() {}
+        GlobalBoundaryPoint(double x, double y, double z, double v, int rank) 
+            : value(v), owner_rank(rank) {
+            coords[0] = x; coords[1] = y; coords[2] = z;
+        }
+    };
+    
+    std::vector<GlobalBoundaryPoint> global_boundary_points;
+    
+public:
+    ParallelCoordinateBasedTransfer(ParMesh* src_mesh, ParFiniteElementSpace* src_fes, 
+                                  ParGridFunction* src_gf)
+        : source_mesh(src_mesh), source_fes(src_fes), source_gf(src_gf) {
+        BuildGlobalBoundaryPointsMap();
+    }
+    
+    // 构建全局边界点映射
+    void BuildGlobalBoundaryPointsMap() {
+        int my_rank, num_procs;
+        MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+        
+        // 步骤1：收集本地边界点
+        std::vector<GlobalBoundaryPoint> local_boundary_points;
+        std::set<int> processed_vertices;  // 避免重复处理顶点
+        
+        for (int i = 0; i < source_mesh->GetNBE(); i++) {
+            Array<int> vertices;
+            source_mesh->GetBdrElementVertices(i, vertices);
+            
+            for (int j = 0; j < vertices.Size(); j++) {
+                int vdof = vertices[j];
+                
+                // 避免重复处理
+                if (processed_vertices.find(vdof) != processed_vertices.end()) {
+                    continue;
+                }
+                processed_vertices.insert(vdof);
+                
+                // 获取顶点坐标
+                double coords[3];
+                source_mesh->GetNode(vdof, coords);
+                
+                // 获取该顶点处的值
+                double value = (*source_gf)(vdof);
+                
+                // 创建边界点
+                local_boundary_points.emplace_back(
+                    coords[0], coords[1], coords[2], value, my_rank
+                );
+            }
+        }
+        
+        // 步骤2：收集每个进程的边界点数量
+        int local_count = local_boundary_points.size();
+        std::vector<int> counts(num_procs);
+        MPI_Allgather(&local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+        
+        // 计算位移和总数
+        std::vector<int> displacements(num_procs);
+        int total_count = 0;
+        for (int i = 0; i < num_procs; i++) {
+            displacements[i] = total_count;
+            total_count += counts[i];
+        }
+        
+        // 步骤3：创建MPI数据类型用于GlobalBoundaryPoint
+        MPI_Datatype mpi_boundary_point_type;
+        {
+            const int nitems = 3;
+            int blocklengths[3] = {3, 1, 1};
+            MPI_Datatype types[3] = {MPI_DOUBLE, MPI_DOUBLE, MPI_INT};
+            MPI_Aint offsets[3];
+            
+            GlobalBoundaryPoint dummy;
+            MPI_Aint base_address;
+            MPI_Get_address(&dummy, &base_address);
+            MPI_Get_address(&dummy.coords[0], &offsets[0]);
+            MPI_Get_address(&dummy.value, &offsets[1]);
+            MPI_Get_address(&dummy.owner_rank, &offsets[2]);
+            
+            for (int i = 0; i < nitems; i++) {
+                offsets[i] -= base_address;
+            }
+            
+            MPI_Type_create_struct(nitems, blocklengths, offsets, types, 
+                                 &mpi_boundary_point_type);
+            MPI_Type_commit(&mpi_boundary_point_type);
+        }
+        
+        // 步骤4：收集所有边界点到所有进程
+        global_boundary_points.resize(total_count);
+        
+        MPI_Allgatherv(local_boundary_points.data(), local_count, mpi_boundary_point_type,
+                       global_boundary_points.data(), counts.data(), displacements.data(),
+                       mpi_boundary_point_type, MPI_COMM_WORLD);
+        
+        // 清理MPI类型
+        MPI_Type_free(&mpi_boundary_point_type);
+        
+        if (my_rank == 0) {
+            std::cout << "全局边界点收集完成，总数: " << total_count << std::endl;
+        }
+    }
+    
+    // 更新边界值（不重建映射）
+    void UpdateBoundaryValues() {
+        int my_rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+        
+        // 每个进程更新自己拥有的边界点的值
+        for (auto& bp : global_boundary_points) {
+            if (bp.owner_rank == my_rank) {
+                // 找到对应的局部顶点并更新值
+                Vector coords(3);
+                coords[0] = bp.coords[0];
+                coords[1] = bp.coords[1];
+                coords[2] = bp.coords[2];
+                
+                // 在本地边界顶点中查找匹配的点
+                for (int i = 0; i < source_mesh->GetNBE(); i++) {
+                    Array<int> vertices;
+                    source_mesh->GetBdrElementVertices(i, vertices);
+                    
+                    for (int j = 0; j < vertices.Size(); j++) {
+                        int vdof = vertices[j];
+                        double node_coords[3];
+                        source_mesh->GetNode(vdof, node_coords);
+                        
+                        double dist = 0.0;
+                        for (int k = 0; k < 3; k++) {
+                            dist += (node_coords[k] - coords[k]) * (node_coords[k] - coords[k]);
+                        }
+                        
+                        if (sqrt(dist) < spatial_tol) {
+                            bp.value = (*source_gf)(vdof);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 广播更新后的值
+        for (int rank = 0; rank < global_boundary_points.size(); rank++) {
+            MPI_Bcast(&global_boundary_points[rank].value, 1, MPI_DOUBLE, 
+                     global_boundary_points[rank].owner_rank, MPI_COMM_WORLD);
+        }
+    }
+    
+    // 获取目标点的值
+    double GetValueAtPoint(const Vector& point) {
+        double min_dist = std::numeric_limits<double>::max();
+        double closest_value = DEFAULT_HEART_POTENTIAL;
+        
+        for (const auto& bp : global_boundary_points) {
+            double dist = 0.0;
+            for (int i = 0; i < 3; i++) {
+                dist += (bp.coords[i] - point(i)) * (bp.coords[i] - point(i));
+            }
+            dist = sqrt(dist);
+            
+            if (dist < min_dist) {
+                min_dist = dist;
+                closest_value = bp.value;
+                
+                if (dist < spatial_tol) {
+                    return closest_value;
+                }
+            }
+        }
+        
+        return closest_value;
+    }
+};
+
+
+
+
+
 void SaveUsingParallelDataCollection(ParMesh *pmesh, ParGridFunction *pgf, const string &output_dir, const string &collection_name, int cycle, MPI_Comm comm)
 {
     int myrank;
@@ -84,7 +281,7 @@ struct BoundaryPoint {
     BoundaryPoint(const Vector& c, double v) : coords(c), value(v) {}
 };
 
-// 辅助类：基于坐标的网格函数插值器
+// 优化后的CoordinateBasedTransfer类定义
 class CoordinateBasedTransfer {
 private:
     ParMesh* source_mesh;
@@ -94,7 +291,15 @@ private:
     // 用于空间查找的容忍度
     const double spatial_tol = 1e-8;
     
-    // 存储源网格边界点的坐标和值
+    // 存储源网格边界点的坐标、索引和值
+    struct BoundaryPoint {
+        Vector coords;
+        int vertex_id;  // 添加顶点ID以便更新
+        double value;
+        
+        BoundaryPoint(const Vector& c, int id, double v) : coords(c), vertex_id(id), value(v) {}
+    };
+    
     std::vector<BoundaryPoint> boundary_points;
 
 public:
@@ -121,12 +326,18 @@ public:
                 source_mesh->GetNode(vdof, coords);
                 
                 // 获取该顶点处的值
-                // 注意：我们使用vdof作为索引获取值（与顶点一一对应）
                 double value = (*source_gf)(vdof);
                 
-                // 存储到向量中
-                boundary_points.emplace_back(coords, value);
+                // 存储顶点ID、坐标和值
+                boundary_points.emplace_back(coords, vdof, value);
             }
+        }
+    }
+    
+    // 新方法：更新边界点的值而不重建映射
+    void UpdateBoundaryValues() {
+        for (auto& bp : boundary_points) {
+            bp.value = (*source_gf)(bp.vertex_id);
         }
     }
 
@@ -160,17 +371,45 @@ public:
 };
 
 // 用于设置边界值的系数函数
+//class BoundaryValuesCoefficient : public Coefficient {
+//private:
+//    CoordinateBasedTransfer* transfer;
+//    
+//public:
+//    BoundaryValuesCoefficient(CoordinateBasedTransfer* t) : transfer(t) {}
+    
+///    virtual double Eval(ElementTransformation& T, const IntegrationPoint& ip) {
+//        Vector physical_coord(3);
+//        T.Transform(ip, physical_coord);
+//        return transfer->GetValueAtPoint(physical_coord);
+//    }
+//};
+
+// 修改 BoundaryValuesCoefficient 类，添加对两种传输类的支持
 class BoundaryValuesCoefficient : public Coefficient {
 private:
     CoordinateBasedTransfer* transfer;
+    ParallelCoordinateBasedTransfer* parallel_transfer;
+    bool use_parallel;
     
 public:
-    BoundaryValuesCoefficient(CoordinateBasedTransfer* t) : transfer(t) {}
+    // 原有构造函数
+    BoundaryValuesCoefficient(CoordinateBasedTransfer* t) 
+        : transfer(t), parallel_transfer(nullptr), use_parallel(false) {}
+    
+    // 新增构造函数
+    BoundaryValuesCoefficient(ParallelCoordinateBasedTransfer* t) 
+        : transfer(nullptr), parallel_transfer(t), use_parallel(true) {}
     
     virtual double Eval(ElementTransformation& T, const IntegrationPoint& ip) {
         Vector physical_coord(3);
         T.Transform(ip, physical_coord);
-        return transfer->GetValueAtPoint(physical_coord);
+        
+        if (use_parallel) {
+            return parallel_transfer->GetValueAtPoint(physical_coord);
+        } else {
+            return transfer->GetValueAtPoint(physical_coord);
+        }
     }
 };
 
@@ -1191,7 +1430,7 @@ int solvePseudoBidomainForUe(
     
     Vector rhs(pfespace->GetTrueVSize());
     rhs = 0.0;
-    A_temp.Mult(-1.0, vm_true, 0.0, rhs);
+    A_temp.Mult(-1.0, vm_true, 0.0, rhs);//
     
     double system_end_time = MPI_Wtime();
     if (my_rank == 0 && print_level > 0) {
@@ -1282,6 +1521,8 @@ int solvePseudoBidomainForUe(
         }
     }
     #endif
+
+    #if 0
     if (enforce_zero_mean && ess_tdof_list.Size() == 0) {
         // 只有rank 0输出
         if (my_rank == 0 && print_level > 0) {
@@ -1360,14 +1601,14 @@ int solvePseudoBidomainForUe(
             }
         }
     }
-
+    #endif
 
 
 
     
     double compat_end_time = MPI_Wtime();
     if (my_rank == 0 && print_level > 0) {
-        std::cout << "相容性检查完成，用时: " << (compat_end_time - compat_start_time) << " 秒" << std::endl;
+        //std::cout << "相容性检查完成，用时: " << (compat_end_time - compat_start_time) << " 秒" << std::endl;
     }
     
     // 5. 输出右侧向量详细信息
@@ -1430,7 +1671,7 @@ int solvePseudoBidomainForUe(
     int pcg_print_level = 0;
     if (print_level > 1) pcg_print_level = 2;  // 显示迭代过程
     if (print_level > 2) pcg_print_level = 3;  // 显示详细信息
-    pcg.SetPrintLevel(3);
+    pcg.SetPrintLevel(1);
     
     // 配置预处理器
     if (my_rank == 0 && print_level > 0) {
@@ -1438,16 +1679,17 @@ int solvePseudoBidomainForUe(
     }
     
     HypreBoomerAMG amg(A);
-    amg.SetPrintLevel(print_level > 2 ? 1 : 0);  // AMG打印级别
+    //amg.SetPrintLevel(print_level > 2 ? 1 : 0);  // AMG打印级别
+    amg.SetPrintLevel(1);
     
     // 设置AMG参数 - 使用正确的方法名称
     amg.SetCoarsening(10);      // HMIS粗化
     amg.SetMaxLevels(25);       // 最大级数
     amg.SetRelaxType(3);        // 混合Gauss-Seidel
-// SetCycleNumSweeps需要两个参数：pre-relaxation和post-relaxation扫描次数
-int prerelax_sweeps = 1;
-int postrelax_sweeps = 1;
-amg.SetCycleNumSweeps(prerelax_sweeps, postrelax_sweeps);
+    // SetCycleNumSweeps需要两个参数：pre-relaxation和post-relaxation扫描次数
+    int prerelax_sweeps = 1;
+    int postrelax_sweeps = 1;
+    amg.SetCycleNumSweeps(prerelax_sweeps, postrelax_sweeps);
     
     pcg.SetPreconditioner(amg);
     
@@ -1474,12 +1716,12 @@ amg.SetCycleNumSweeps(prerelax_sweeps, postrelax_sweeps);
     X = 0.0;  // 初始猜测为零
     
     // 执行求解
- double t_ksp2_start = MPI_Wtime();
-pcg.Mult(rhs, X);
-double t_ksp2_end = MPI_Wtime();
-if (t_ksp2_total != nullptr) {
+    double t_ksp2_start = MPI_Wtime();
+    pcg.Mult(rhs, X);
+    double t_ksp2_end = MPI_Wtime();
+    if (t_ksp2_total != nullptr) {
     *t_ksp2_total += (t_ksp2_end - t_ksp2_start);
-}
+    }
     
     double solve_end_time = MPI_Wtime();
     
@@ -1600,6 +1842,7 @@ if (t_ksp2_total != nullptr) {
     
     // 9. 清理资源
     delete a;
+
     
     // 10. 总结
     double end_time = MPI_Wtime();
@@ -1732,6 +1975,11 @@ int main(int argc, char *argv[])
 
    units_internal(1e-3, 1e-9, 1e-3, 1e-3, 1, 1e-9, 1);
    units_external(1e-3, 1e-9, 1e-3, 1e-3, 1, 1e-9, 1);
+
+   bool use_petsc = true;//false;true
+   const char *petscrc_file = "rc_fem_heart";
+   MFEMInitializePetsc(NULL,NULL,petscrc_file,NULL);
+
 
        // --- Timer Variable Declarations ---
     double t_start, t_end; // Temporary start/end times
@@ -2089,9 +2337,11 @@ int main(int argc, char *argv[])
     delete[] ptorso_meshpart;
 
 
-  // 3. 创建网格值传输器
-  CoordinateBasedTransfer* transfer = 
-  new CoordinateBasedTransfer(pmesh, pfespace, &gf_ue);
+    // 在时间循环之前初始化交界面处理对象 - 添加这段代码
+    //CoordinateBasedTransfer* transfer = nullptr;
+    //BoundaryValuesCoefficient* bdr_coef = nullptr;
+    ParallelCoordinateBasedTransfer* parallel_transfer = nullptr;
+    BoundaryValuesCoefficient* bdr_coef = nullptr;
         
     
     if (my_rank == 0) {
@@ -2124,18 +2374,6 @@ int main(int argc, char *argv[])
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
    // Load fiber quaternions from file
    std::shared_ptr<GridFunction> flat_fiber_quat;
    ecg_readGF(obj, "fibers", mesh, flat_fiber_quat);
@@ -2162,7 +2400,7 @@ int main(int argc, char *argv[])
       Vector sigma_m_neg_vec(3);
       for (int jj=0; jj<3; jj++)
       {
-         double value = sigma_m[heartCursor+jj]*dt/2/Bm/Cm;
+         double value = sigma_m[jj]*dt/2/Bm/Cm;
          sigma_m_pos_vec[jj] = value;
          sigma_m_neg_vec[jj] = -value;
       }
@@ -2211,21 +2449,48 @@ int main(int argc, char *argv[])
    
    // Brought out of loop to avoid unnecessary duplication
    ParBilinearForm *a = new ParBilinearForm(pfespace);   // defines a.
+if(use_petsc)//use petsc
+{
+   a->SetOperatorType(Operator::PETSC_MATAIJ);
+}
    a->AddDomainIntegrator(new DiffusionIntegrator(sigma_m_pos_coeffs));
    a->AddDomainIntegrator(new MassIntegrator(one));
    a->Update(pfespace);
-   a->Assemble();
+   a->Assemble(use_petsc ? 0 : 1);
+
    HypreParMatrix LHS_mat;
+   HyprePCG* pcg = nullptr;
+   HypreSolver *M_test = nullptr;
+
+   PetscPCGSolver* pcg_monodomain_petsc = nullptr;
+   PetscParMatrix LHS_monodomain_petsc;
+if(!use_petsc)//use petsc
+{
    a->FormSystemMatrix(ess_tdof_list,LHS_mat);
+   pcg = new HyprePCG(LHS_mat);
+   pcg->SetTol(1e-6);
+   pcg->SetMaxIter(1000);
+   pcg->SetPrintLevel(2);
+   M_test = new HypreBoomerAMG(LHS_mat);
+   pcg->SetPreconditioner(*M_test);
+}
+else
+{
+    a->FormSystemMatrix(ess_tdof_list, LHS_monodomain_petsc);
+    pcg_monodomain_petsc = new PetscPCGSolver(MPI_COMM_WORLD);
+   pcg_monodomain_petsc->SetOperator(LHS_monodomain_petsc);
+   pcg_monodomain_petsc->SetRelTol(1e-6);
+   //pcg_monodomain_petsc->SetAbsTol(1e-12);
+   pcg_monodomain_petsc->SetMaxIter(1000);
+   pcg_monodomain_petsc->SetPrintLevel(2);
+}
    EndTimer();
 
-   //Set up the solve
-   HyprePCG pcg(LHS_mat);
-   pcg.SetTol(1e-12);
-   pcg.SetMaxIter(2000);
-   pcg.SetPrintLevel(2);
-   HypreSolver *M_test = new HypreBoomerAMG(LHS_mat);
-   pcg.SetPreconditioner(*M_test);
+
+
+
+
+
 
 
    //Set up the ionic models
@@ -2302,17 +2567,129 @@ int main(int argc, char *argv[])
 
 
 
+ // 创建电导率系数（在时间循环外，只创建一次）
+MatrixElementPiecewiseCoefficient sigma_i(fiber_quat, sheet_quat, transverse_quat);
+MatrixElementPiecewiseCoefficient sigma_sum(fiber_quat, sheet_quat, transverse_quat);
+
+for (int ii = 0; ii < heartRegions.size(); ii++) {
+    int heartCursor = 3 * ii;
+    
+    Vector sigma_i_vec(3);
+    Vector sigma_e_vec(3);
+    Vector sigma_sum_vec(3);
+    
+    for (int jj = 0; jj < 3; jj++) {
+        sigma_i_vec[jj] = sigma_i_values[heartCursor + jj];
+        sigma_e_vec[jj] = sigma_e_values[heartCursor + jj];
+        sigma_sum_vec[jj] = (sigma_i_vec[jj] + sigma_e_vec[jj]);
+    }
+    
+    sigma_i.heartConductivities_[heartRegions[ii]] = sigma_i_vec;
+    sigma_sum.heartConductivities_[heartRegions[ii]] = sigma_sum_vec;
+}
+
+// 设置左侧矩阵: -∇·((σ_i + σ_e)∇u_e)
+ParBilinearForm *a_pblf_recoverue = new ParBilinearForm(pfespace);
+if(use_petsc)
+{
+    a_pblf_recoverue->SetOperatorType(Operator::PETSC_MATAIJ);
+}
+a_pblf_recoverue->AddDomainIntegrator(new DiffusionIntegrator(sigma_sum));
+a_pblf_recoverue->Assemble(use_petsc ? 0 : 1);  // 注意这里的参数，与torso一致
+a_pblf_recoverue->Finalize();
+
+// 设置右侧向量的临时双线性形式: ∇·(σ_i∇V_m)
+ParBilinearForm* temp_form = new ParBilinearForm(pfespace);  // 改为指针，与torso风格一致
+if(use_petsc)
+{
+    temp_form->SetOperatorType(Operator::PETSC_MATAIJ);
+}
+temp_form->AddDomainIntegrator(new DiffusionIntegrator(sigma_i));
+temp_form->Assemble(use_petsc ? 0 : 1);
+temp_form->Finalize();
+
+// 声明矩阵和求解器（与torso完全一致的风格）
+HypreBoomerAMG* precond_recoverue_hypre = nullptr;
+HyprePCG* pcg_recoverue_hypre = nullptr;
+HypreParMatrix A_recoverue_hypre;  // 栈对象，与torso一致
+
+PetscPCGSolver* pcg_recoverue_petsc = nullptr;
+PetscParMatrix A_recoverue_petsc;  // 栈对象，与torso一致
+
+// 临时矩阵也用相同风格
+HypreParMatrix A_temp_hypre;
+PetscParMatrix A_temp_petsc;
+
+Vector B_recoverue, X_recoverue;
+Vector vm_true(pfespace->GetTrueVSize());
+Vector rhs_recoverue(pfespace->GetTrueVSize());
+
+// 初始化求解器
+if (!use_petsc)
+{
+    precond_recoverue_hypre = new HypreBoomerAMG;
+    pcg_recoverue_hypre = new HyprePCG(MPI_COMM_WORLD);
+    
+    // 形成系统矩阵
+    a_pblf_recoverue->FormSystemMatrix(ess_tdof_list, A_recoverue_hypre);
+    temp_form->FormSystemMatrix(ess_tdof_list, A_temp_hypre);
+    
+    precond_recoverue_hypre->SetPrintLevel(0);
+    pcg_recoverue_hypre->SetPreconditioner(*precond_recoverue_hypre);
+    pcg_recoverue_hypre->SetOperator(A_recoverue_hypre);
+    pcg_recoverue_hypre->SetTol(1e-6);
+    pcg_recoverue_hypre->SetMaxIter(1000);
+    pcg_recoverue_hypre->SetPrintLevel(1);
+}
+else
+{
+    // 形成系统矩阵（PETSc版本）
+    a_pblf_recoverue->FormSystemMatrix(ess_tdof_list, A_recoverue_petsc);
+    temp_form->FormSystemMatrix(ess_tdof_list, A_temp_petsc);
+    
+    pcg_recoverue_petsc = new PetscPCGSolver(MPI_COMM_WORLD, "recoverue_", true);
+    // 如果PetscPCGSolver需要SetOperator，添加：
+    pcg_recoverue_petsc->SetOperator(A_recoverue_petsc);
+}
+
+X_recoverue.SetSize(pfespace->GetTrueVSize());
+X_recoverue = 0.0;  // 初始猜测为零
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
         // 5. 创建双线性型和线性型
-        ParBilinearForm* a_torsoSolver = new ParBilinearForm(pfespace_torso);
+        ParBilinearForm* a_pblf_torso = new ParBilinearForm(pfespace_torso);
+if(use_petsc)
+{
+   a_pblf_torso->SetOperatorType(Operator::PETSC_MATAIJ);
+}
+
         ConstantCoefficient sigma_torso_coeff(sigma_torso);
-        a_torsoSolver->AddDomainIntegrator(new DiffusionIntegrator(sigma_torso_coeff));
-        a_torsoSolver->Assemble();
-        a_torsoSolver->Finalize();
+        a_pblf_torso->AddDomainIntegrator(new DiffusionIntegrator(sigma_torso_coeff));
+        a_pblf_torso->Assemble(use_petsc ? 0 : 1);
+        a_pblf_torso->Finalize();
 
         // 创建线性型
-        ParLinearForm* b_torsoSolver = new ParLinearForm(pfespace_torso);
+        ParLinearForm* b_plf_torso = new ParLinearForm(pfespace_torso);
                 // 为源边界创建边界属性数组
                 Array<int> source_bdr_torso(pmesh_torso->bdr_attributes.Max());
                 source_bdr_torso = 0;
@@ -2321,10 +2698,60 @@ int main(int argc, char *argv[])
         Array<int> ess_bdr_torso(pmesh_torso->bdr_attributes.Max());
         ess_bdr_torso = 0;
         ess_bdr_torso[BoundaryType::DIRICHLET-1] = 1; 
-            Array<int> ess_tdof_list_torso;
+        Array<int> ess_tdof_list_torso;
         pfespace_torso->GetEssentialTrueDofs(ess_bdr_torso, ess_tdof_list_torso);
 // 创建包含边界值的系数函数
-BoundaryValuesCoefficient* bdr_coef = new BoundaryValuesCoefficient(transfer); 
+
+    if (solve_torso_model && pmesh && pfespace && pfespace_torso) {
+        if (my_rank == 0) {
+            std::cout << "初始化心脏-躯干交界面传输对象..." << std::endl;
+        }
+        
+        // 创建对象一次，之后只更新值
+        //transfer = new CoordinateBasedTransfer(pmesh, pfespace, &gf_ue);
+        //bdr_coef = new BoundaryValuesCoefficient(transfer);
+            parallel_transfer = new ParallelCoordinateBasedTransfer(pmesh, pfespace, &gf_ue);
+            bdr_coef = new BoundaryValuesCoefficient(parallel_transfer);
+        
+        if (my_rank == 0) {
+            std::cout << "心脏-躯干交界面传输对象初始化完成。" << std::endl;
+        }
+    }
+
+//Set matrix and vector for Torso model
+HypreBoomerAMG* precond_hypre = nullptr;
+HyprePCG* pcg_hypre = nullptr;
+HypreParMatrix A_torso_hypre;
+
+PetscPCGSolver* pcg_petsc = nullptr;
+PetscParMatrix A_torso_petsc;
+
+Vector B_torso, X_torso;
+
+   if (!use_petsc)
+   {
+        precond_hypre = new HypreBoomerAMG;
+        pcg_hypre = new HyprePCG(MPI_COMM_WORLD);    
+        //parcsr_A_hypre = parcsr_A_hypre.As<HypreParMatrix>();
+        a_pblf_torso->FormSystemMatrix(ess_tdof_list_torso, A_torso_hypre);
+
+        precond_hypre->SetPrintLevel(0);
+        pcg_hypre->SetPreconditioner(*precond_hypre);
+        pcg_hypre->SetOperator(A_torso_hypre);
+        pcg_hypre->SetTol(1e-4);
+        pcg_hypre->SetMaxIter(1000);
+        pcg_hypre->SetPrintLevel(1);
+   }
+   else
+   {
+        pcg_petsc = new PetscPCGSolver(MPI_COMM_WORLD, "torso_", true);
+   }
+
+
+
+
+
+
 
 
     MPI_Barrier(MPI_COMM_WORLD); // Sync before starting overall timer
@@ -2406,8 +2833,6 @@ double t_total_end;
                 }
             std::cout << "有效ueDataBuffer电势值节点数: " << valid_values << " 总节点数: " << ueDataBuffer.size() << std::endl;
             }
-
-
          }
          else
          {
@@ -2460,7 +2885,17 @@ t_ionic_start = MPI_Wtime();
       //compute the Iion and stimulus contribution
       c->Update();
       c->Assemble();
+
+   if (!use_petsc)
+   {
       a->FormLinearSystem(ess_tdof_list, gf_Vm, *c, LHS_mat, actual_Vm, actual_b, 1);
+    }
+    else
+    {
+        a->FormLinearSystem(ess_tdof_list, gf_Vm, *c, LHS_monodomain_petsc, actual_Vm, actual_b, 1);
+    }
+
+
       //compute the RHS matrix contribution
       RHS_mat.Mult(actual_Vm, actual_old);
       actual_b += actual_old;
@@ -2472,7 +2907,14 @@ t_ionic_start = MPI_Wtime();
       }
       //solve the matrix
       t_ksp1_start = MPI_Wtime();
-      pcg.Mult(actual_b, actual_Vm);
+         if (!use_petsc)
+   {
+      pcg->Mult(actual_b, actual_Vm);
+    }
+    else
+    {
+        pcg_monodomain_petsc->Mult(actual_b, actual_Vm);
+    }
       t_ksp1_end = MPI_Wtime();
       t_ksp1_total += (t_ksp1_end - t_ksp1_start);
 
@@ -2485,24 +2927,97 @@ t_ionic_start = MPI_Wtime();
           }
           
           // 设置统一的打印级别
-          int local_print_level = (my_rank == 0 && itime % 50 == 0) ? 1 : 0;
+          int local_print_level = (my_rank == 0 && itime % 50 == 0) ? 3 : 0;
           int global_print_level;
           MPI_Allreduce(&local_print_level, &global_print_level, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
           
-          try {
+
+
+
+
+
+
+
               // 使用统一的打印级别求解细胞外电位
-              solvePseudoBidomainForUe(
-                  pmesh, pfespace, gf_Vm, gf_ue, 
-                  sigma_i_values, sigma_e_values, fiber_quat, sheet_quat, transverse_quat,
-                  ess_tdof_list, heartRegions, true,
-                  global_print_level, &t_ksp2_total
-              );
-          } catch (const std::exception& e) {
-              // 确保所有进程都知道发生了异常
-              if (my_rank == 0) {
-                  std::cerr << "求解细胞外电位时发生错误: " << e.what() << std::endl;
-              }
-          }
+              //solvePseudoBidomainForUe(
+               //   pmesh, pfespace, gf_Vm, gf_ue, 
+                //  sigma_i_values, sigma_e_values, fiber_quat, sheet_quat, transverse_quat,
+                //  ess_tdof_list, heartRegions, true,
+                //  global_print_level, &t_ksp2_total//);
+
+
+    gf_Vm.GetTrueDofs(vm_true);
+    
+    // 计算右侧向量: -∇·(σ_i∇V_m)
+    if (!use_petsc) {
+        A_temp_hypre.Mult(-1.0, vm_true, 0.0, rhs_recoverue);
+    } else {
+        A_temp_petsc.Mult(-1.0, vm_true, 0.0, rhs_recoverue);
+    }
+    
+    // 记录求解时间
+    t_ksp2_start = MPI_Wtime();
+    
+    // 求解线性系统
+    if (!use_petsc) {
+        pcg_recoverue_hypre->Mult(rhs_recoverue, X_recoverue);
+    } else {
+        pcg_recoverue_petsc->Mult(rhs_recoverue, X_recoverue);
+    }
+    
+    t_ksp2_end = MPI_Wtime();
+    t_ksp2_total += (t_ksp2_end - t_ksp2_start);
+    
+    // 更新网格函数
+    gf_ue.SetFromTrueDofs(X_recoverue);
+
+    // 如果需要，强制解的均值为零
+    if (ess_tdof_list.Size() == 0) {//enforce zero mean
+        double local_sum = 0.0;
+        for (int i = 0; i < X_recoverue.Size(); i++) {
+            local_sum += X_recoverue(i);
+        }
+        
+        double global_sum = 0.0;
+        MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        
+        double global_count = 0.0;
+        local_sum = X_recoverue.Size();
+        MPI_Allreduce(&local_sum, &global_count, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        
+        double mean_value = global_sum / global_count;
+        
+        if (fabs(mean_value) > 1e-6) {
+            if (my_rank == 0) {
+                std::cout << "调整解向量以确保均值为零，当前均值: " << mean_value << std::endl;
+            }
+            
+            // 从解中减去平均值
+            for (int i = 0; i < X_recoverue.Size(); i++) {
+                X_recoverue(i) -= mean_value;
+            }
+            
+            // 更新网格函数
+            gf_ue.SetFromTrueDofs(X_recoverue);
+            
+            if (my_rank == 0) {
+                std::cout << "已从解中减去均值: " << mean_value << std::endl;
+            }
+        } else {
+            if (my_rank == 0) {
+                std::cout << "解向量均值已经接近零: " << mean_value << "，无需调整。" << std::endl;
+            }
+        }
+    }
+
+
+
+
+
+
+
+
+
       }
       
 // 在时间迭代循环中，找到求解伪双域模型的部分后面
@@ -2511,21 +3026,11 @@ if (solve_torso_model  && pmesh_torso && pfespace_torso && gf_ue_torso) {
        std::cout << "\n===== 求解Torso模型 =====\n" << std::endl;
    }
    
-   try {
+   //try {
 
     // 释放旧的传输器
-    if (transfer) {
-        delete transfer;
-        transfer = nullptr;
-    }
-    if (bdr_coef) {
-        delete bdr_coef;
-        bdr_coef = nullptr;
-    }
-    
-    // 创建新的传输器，使用最新的心脏解
-    transfer = new CoordinateBasedTransfer(pmesh, pfespace, &gf_ue);
-    bdr_coef = new BoundaryValuesCoefficient(transfer);
+ //transfer->UpdateBoundaryValues();
+ parallel_transfer->UpdateBoundaryValues();
 
 
 
@@ -2556,7 +3061,7 @@ if (solve_torso_model  && pmesh_torso && pfespace_torso && gf_ue_torso) {
     //ConstantCoefficient source_coeff(1.0);
     //b_torsoSolver->AddBoundaryIntegrator(new BoundaryLFIntegrator(source_coeff),
                                     //source_bdr_torso);
-    b_torsoSolver->Assemble();
+    b_plf_torso->Assemble();
 
 
 
@@ -2566,39 +3071,48 @@ if (solve_torso_model  && pmesh_torso && pfespace_torso && gf_ue_torso) {
         
 
         // 7. 求解线性系统
-        OperatorPtr A_torsoSolver;
-        Vector B_torsoSolver, X_torsoSolver;
-        a_torsoSolver->FormLinearSystem(ess_tdof_list_torso,
-             *gf_ue_torso, *b_torsoSolver, 
-             A_torsoSolver, X_torsoSolver, B_torsoSolver);
-        
-        // 设置求解器
-        HypreBoomerAMG* precond_torsoSolver = new HypreBoomerAMG;
-        HyprePCG* pcg_torsoSolver = new HyprePCG(MPI_COMM_WORLD);
-        
-        HypreParMatrix* parcsr_A = A_torsoSolver.As<HypreParMatrix>();
-        
-        precond_torsoSolver->SetPrintLevel(0);
-        pcg_torsoSolver->SetPreconditioner(*precond_torsoSolver);
-        pcg_torsoSolver->SetOperator(*parcsr_A);
-        pcg_torsoSolver->SetTol(1e-12);
-        pcg_torsoSolver->SetMaxIter(1000);
-        pcg_torsoSolver->SetPrintLevel(1);
-        
-        // 求解线性系统
+        //OperatorPtr A_torsoSolver;
+
+
+
+   if (!use_petsc)
+   {
+        a_pblf_torso->FormLinearSystem(ess_tdof_list_torso, *gf_ue_torso, *b_plf_torso, 
+             A_torso_hypre, X_torso, B_torso);
         t_ksp3_start = MPI_Wtime();
-        pcg_torsoSolver->Mult(B_torsoSolver, X_torsoSolver);
+        pcg_hypre->Mult(B_torso, X_torso);
+        t_ksp3_end = MPI_Wtime();
+        t_ksp3_total += (t_ksp3_end - t_ksp3_start);
+   }
+   else
+   {
+      a_pblf_torso->FormLinearSystem(ess_tdof_list_torso, *gf_ue_torso, *b_plf_torso,
+                A_torso_petsc, X_torso, B_torso);
+      //pcg_petsc = new PetscPCGSolver(*A_torso_petsc);
+        
+        pcg_petsc->SetOperator(A_torso_petsc);
+
+              //pcg_petsc->iterative_mode = true; // iterative_mode is true by default with CGSolver
+      pcg_petsc->SetRelTol(1e-4);
+      pcg_petsc->SetAbsTol(1e-10);
+      pcg_petsc->SetMaxIter(3000);
+      pcg_petsc->SetPrintLevel(3); // 提高打印级别
+
+      t_ksp3_start = MPI_Wtime();
+      pcg_petsc->Mult(B_torso, X_torso);
       t_ksp3_end = MPI_Wtime();
       t_ksp3_total += (t_ksp3_end - t_ksp3_start);
+
+   }
+
         
         // 8. 恢复解
-        a_torsoSolver->RecoverFEMSolution(X_torsoSolver, *b_torsoSolver, *gf_ue_torso);
+        a_pblf_torso->RecoverFEMSolution(X_torso, *b_plf_torso, *gf_ue_torso);
 
  t_total_end = MPI_Wtime();
     t_total += (t_total_end - t_total_start);
 
-delete pcg_torsoSolver;
-delete precond_torsoSolver;
+
 
 
 
@@ -2642,11 +3156,11 @@ delete precond_torsoSolver;
 #endif
 
 
-   } catch (const std::exception& e) {
-       if (my_rank == 0) {
-           std::cerr << "处理Torso模型时发生异常: " << e.what() << std::endl;
-       }
-   }
+   //} catch (const std::exception& e) {
+       //if (my_rank == 0) {
+           //std::cerr << "处理Torso模型时发生异常: " << e.what() << std::endl;
+       //}
+   //}
    
    if (my_rank == 0 && itime % 10 == 0) {
        std::cout << "\n===== Torso模型处理完成 =====\n" << std::endl;
@@ -2729,12 +3243,16 @@ delete precond_torsoSolver;
 
    // 14. Free the used memory.
    delete M_test;
+   delete pcg;
    delete a;
    delete b;
    delete c;
    if (rf) delete rf;
    if (Iion_blf) delete Iion_blf;
    delete pfespace;
+   delete fespace;
+delete torso_fec;
+if (pcg_monodomain_petsc) delete pcg_monodomain_petsc;
    if (order > 0) { delete fec; }
    delete mesh;
    delete pmesh;
@@ -2745,12 +3263,21 @@ delete precond_torsoSolver;
     if (pmesh_torso) delete pmesh_torso;
     if (torso_mesh) delete torso_mesh;
     // 主函数末尾资源清理部分应该还需要添加：
-if (transfer) delete transfer;
+//if (transfer) delete transfer;
+if (parallel_transfer) delete parallel_transfer;
 if (bdr_coef) delete bdr_coef;
 delete torso_fec; // 此行未出现在清理代码中
 
-if (a_torsoSolver) delete a_torsoSolver;
-if (b_torsoSolver) delete b_torsoSolver;
+if (a_pblf_torso) delete a_pblf_torso;
+if (b_plf_torso) delete b_plf_torso;
+delete pcg_hypre;
+delete precond_hypre;
+delete pcg_petsc;
+
+
+
+MFEMFinalizePetsc();
+MPI_Finalize();
    
    return 0;
 }
