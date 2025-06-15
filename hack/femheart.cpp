@@ -586,6 +586,17 @@ visit_dc.SetPrefixPath(data_path);
     visit_dc_torso.Load();
     //cout << "visit_dc_torso Loaded;" << endl;
     pmesh_torso = dynamic_cast<ParMesh*>(visit_dc_torso.GetMesh());
+    
+    // 验证细化前后的单元数量
+int ne_before = pmesh_torso->GetNE();
+pmesh_torso->UniformRefinement();
+int ne_after = pmesh_torso->GetNE();
+
+if (my_rank == 0) {
+    cout << "细化前单元数: " << ne_before << endl;
+    cout << "细化后单元数: " << ne_after << endl;
+    cout << "增长倍数: " << (double)ne_after/ne_before << endl;
+}
 
 
    // Read shared global mesh
