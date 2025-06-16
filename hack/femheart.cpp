@@ -564,17 +564,26 @@ visit_dc.SetPrefixPath(data_path);
 
 
    ParMesh *pmesh;
-   ParGridFunction *saved_fiber;
-   ParGridFunction *saved_sheet;
-   ParGridFunction *saved_transverse;
 
    visit_dc.Load();
     //cout << "visit_dc Loaded;" << endl;
     pmesh = dynamic_cast<ParMesh*>(visit_dc.GetMesh());
 
-   saved_fiber = visit_dc.GetParField("fiber");
-   saved_sheet = visit_dc.GetParField("sheet");
-   saved_transverse = visit_dc.GetParField("trans");
+    int ne_before_ = pmesh->GetNE();
+pmesh->UniformRefinement();
+pmesh->UniformRefinement();
+
+int ne_after_ = pmesh->GetNE();
+if (my_rank == 0) {
+    cout << "细化前heart单元数: " << ne_before_ << endl;
+    cout << "细化后heart单元数: " << ne_after_ << endl;
+    cout << "增长倍数: " << (double)ne_after_/ne_before_ << endl;
+}
+
+
+   //saved_fiber = visit_dc.GetParField("fiber");
+   //saved_sheet = visit_dc.GetParField("sheet");
+   //saved_transverse = visit_dc.GetParField("trans");
    //cout << "visit_dc Got ParField" << endl;
 
 
@@ -589,6 +598,7 @@ visit_dc.SetPrefixPath(data_path);
     
     // 验证细化前后的单元数量
 int ne_before = pmesh_torso->GetNE();
+pmesh_torso->UniformRefinement();
 pmesh_torso->UniformRefinement();
 int ne_after = pmesh_torso->GetNE();
 
@@ -775,6 +785,43 @@ if (my_rank == 0) {
 
    
 
+
+
+// 为纤维方向创建专门的向量有限元空间
+FiniteElementCollection *vector_fec = new H1_FECollection(order, dim);
+ParFiniteElementSpace *vector_pfespace = new ParFiniteElementSpace(pmesh, vector_fec, 3); // 维数为3
+
+// 使用向量空间创建ParGridFunction
+ParGridFunction *saved_fiber = new ParGridFunction(vector_pfespace);
+ParGridFunction *saved_sheet = new ParGridFunction(vector_pfespace);
+ParGridFunction *saved_transverse = new ParGridFunction(vector_pfespace);
+
+// 现在可以正确设置3D向量
+int vdim = vector_pfespace->GetVDim(); // 现在应该是3
+int local_size = saved_fiber->Size();
+
+if (my_rank == 0) {
+    std::cout << "Vector dimension: " << vdim << std::endl;
+    std::cout << "Local vector size: " << local_size << std::endl;
+}
+
+// 正确的DOF赋值
+for (int i = 0; i < local_size / vdim; i++) {
+    // 纤维方向 (1,0,0)
+    (*saved_fiber)[i*vdim + 0] = 1.0;
+    (*saved_fiber)[i*vdim + 1] = 0.0;
+    (*saved_fiber)[i*vdim + 2] = 0.0;
+    
+    // 薄片方向 (0,1,0)
+    (*saved_sheet)[i*vdim + 0] = 0.0;
+    (*saved_sheet)[i*vdim + 1] = 1.0;
+    (*saved_sheet)[i*vdim + 2] = 0.0;
+    
+    // 横向方向 (0,0,1)
+    (*saved_transverse)[i*vdim + 0] = 0.0;
+    (*saved_transverse)[i*vdim + 1] = 0.0;
+    (*saved_transverse)[i*vdim + 2] = 1.0;
+}
 
 
 
