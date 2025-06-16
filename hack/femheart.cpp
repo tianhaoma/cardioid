@@ -574,6 +574,7 @@ visit_dc.SetPrefixPath(data_path);
 
     int ne_before_ = pmesh->GetNE();
 pmesh->UniformRefinement();
+pmesh->UniformRefinement();
 int ne_after_ = pmesh->GetNE();
 
 if (my_rank == 0) {
@@ -599,6 +600,7 @@ if (my_rank == 0) {
     
     // 验证细化前后的单元数量
 int ne_before = pmesh_torso->GetNE();
+pmesh_torso->UniformRefinement();
 pmesh_torso->UniformRefinement();
 int ne_after = pmesh_torso->GetNE();
 
