@@ -580,7 +580,8 @@ visit_dc.SetPrefixPath(data_path);
     pmesh = dynamic_cast<ParMesh*>(visit_dc.GetMesh());
 
     int ne_before_ = pmesh->GetNE();
-//pmesh->UniformRefinement();
+pmesh->UniformRefinement();
+pmesh->UniformRefinement();
 //pmesh->UniformRefinement();
 int ne_after_ = pmesh->GetNE();
 
@@ -608,7 +609,8 @@ if (my_rank == 0) {
     // 验证细化前后的单元数量
 int ne_before = pmesh_torso->GetNE();
 //pmesh_torso->UniformRefinement();
-//pmesh_torso->UniformRefinement();
+pmesh_torso->UniformRefinement();
+pmesh_torso->UniformRefinement();
 int ne_after = pmesh_torso->GetNE();
 
 if (my_rank == 0) {
