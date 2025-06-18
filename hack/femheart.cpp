@@ -515,7 +515,14 @@ int main(int argc, char *argv[])
     double t_ksp3_total = 0.0;     // e.g., Other KSP (if applicable)
     double t_ionic_model_total = 0.0;
     double t_ionic_start, t_ksp1_start, t_ksp2_start, t_ksp3_start;
-    double t_ionic_end, t_ksp1_end, t_ksp2_end, t_ksp3_end; 
+    double t_ionic_end, t_ksp1_end, t_ksp2_end, t_ksp3_end;
+
+    static int total_iterations_monodomain = 0;
+    static int solve_count_monodomain = 0;
+    static int total_iterations_recoverue = 0;
+    static int solve_count_recoverue = 0;
+    static int total_iterations_torso = 0;
+    static int solve_count_torso = 0;
 
 
 
@@ -573,8 +580,8 @@ visit_dc.SetPrefixPath(data_path);
     pmesh = dynamic_cast<ParMesh*>(visit_dc.GetMesh());
 
     int ne_before_ = pmesh->GetNE();
-pmesh->UniformRefinement();
-pmesh->UniformRefinement();
+//pmesh->UniformRefinement();
+//pmesh->UniformRefinement();
 int ne_after_ = pmesh->GetNE();
 
 if (my_rank == 0) {
@@ -600,8 +607,8 @@ if (my_rank == 0) {
     
     // 验证细化前后的单元数量
 int ne_before = pmesh_torso->GetNE();
-pmesh_torso->UniformRefinement();
-pmesh_torso->UniformRefinement();
+//pmesh_torso->UniformRefinement();
+//pmesh_torso->UniformRefinement();
 int ne_after = pmesh_torso->GetNE();
 
 if (my_rank == 0) {
@@ -1380,6 +1387,11 @@ t_ionic_start = MPI_Wtime();
     else
     {
         pcg_monodomain_petsc->Mult(actual_b, actual_Vm);
+                int current_iterations = pcg_monodomain_petsc->GetNumIterations();
+    total_iterations_monodomain += current_iterations;
+    solve_count_monodomain++;
+    
+
     }
       t_ksp1_end = MPI_Wtime();
       t_ksp1_total += (t_ksp1_end - t_ksp1_start);
@@ -1417,6 +1429,10 @@ t_ionic_start = MPI_Wtime();
         pcg_recoverue_hypre->Mult(rhs_recoverue, X_recoverue);
     } else {
         pcg_recoverue_petsc->Mult(rhs_recoverue, X_recoverue);
+        int current_iterations = pcg_recoverue_petsc->GetNumIterations();
+    total_iterations_recoverue += current_iterations;
+    solve_count_recoverue++;
+    
     }
     
     t_ksp2_end = MPI_Wtime();
@@ -1515,6 +1531,12 @@ if (solve_torso_model  && pmesh_torso && pfespace_torso && gf_ue_torso) {
       pcg_petsc->Mult(B_torso, X_torso);
       t_ksp3_end = MPI_Wtime();
       t_ksp3_total += (t_ksp3_end - t_ksp3_start);
+          // 获取PETSc求解器的迭代次数
+    int current_iterations = pcg_petsc->GetNumIterations();
+    total_iterations_torso += current_iterations;
+    solve_count_torso++;
+    
+
 
    }
 
@@ -1563,7 +1585,11 @@ if (solve_torso_model  && pmesh_torso && pfespace_torso && gf_ue_torso) {
     MPI_Reduce(&t_ksp3_total, &t_ksp3_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD); // Remember this is placeholder
     MPI_Reduce(&t_ionic_model_total, &t_ionic_model_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-
+    if (my_rank == 0) {
+        std::cout << "monodomain 平均迭代次数: " << (double)total_iterations_monodomain / solve_count_monodomain << std::endl;
+        std::cout << "re ue 平均迭代次数: " << (double)total_iterations_recoverue / solve_count_recoverue << std::endl;
+        std::cout << "torso 平均迭代次数: " << (double)total_iterations_torso / solve_count_torso << std::endl;
+    }
 
 
 
