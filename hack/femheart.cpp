@@ -67,6 +67,11 @@ private:
     };
     
     std::vector<GlobalBoundaryPoint> global_boundary_points;
+
+    // 用来存储每个进程拥有的边界点数量
+    std::vector<int> points_counts_per_rank_; 
+    // 用来存储Allgatherv需要的位移信息
+    std::vector<int> points_disps_per_rank_;  
     
 public:
     ParallelCoordinateBasedTransfer(ParMesh* src_mesh, ParFiniteElementSpace* src_fes, 
@@ -158,6 +163,11 @@ public:
         
         // 清理MPI类型
         MPI_Type_free(&mpi_boundary_point_type);
+
+            // 将计算好并使用过的 counts 和 displacements 保存到成员变量中，以备后用
+    points_counts_per_rank_ = counts;
+    points_disps_per_rank_ = displacements;
+
         
         if (my_rank == 0) {
             std::cout << "全局边界点收集完成，总数: " << total_count << std::endl;
@@ -166,47 +176,64 @@ public:
     
     // 更新边界值（不重建映射）
     void UpdateBoundaryValues() {
-        int my_rank;
-        MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
-        
-        // 每个进程更新自己拥有的边界点的值
-        for (auto& bp : global_boundary_points) {
-            if (bp.owner_rank == my_rank) {
-                // 找到对应的局部顶点并更新值
-                Vector coords(3);
-                coords[0] = bp.coords[0];
-                coords[1] = bp.coords[1];
-                coords[2] = bp.coords[2];
-                
-                // 在本地边界顶点中查找匹配的点
-                for (int i = 0; i < source_mesh->GetNBE(); i++) {
-                    Array<int> vertices;
-                    source_mesh->GetBdrElementVertices(i, vertices);
+            int my_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+
+    // 阶段一：每个进程收集自己“拥有”的点的最新电势值
+    std::vector<double> local_updated_values;
+    // 使用预先存储的数量来预分配内存，提高效率
+    local_updated_values.reserve(points_counts_per_rank_[my_rank]); 
+
+    // 这个循环仍然需要遍历全局点来识别哪些是自己的
+    for (const auto& bp : global_boundary_points) {
+        if (bp.owner_rank == my_rank) {
+            // 注意：这里的本地搜索逻辑与原来相同，它本身也可能成为一个CPU瓶颈。
+            // 但我们当前的首要目标是解决通信瓶颈。
+            bool found = false;
+            for (int i = 0; i < source_mesh->GetNBE(); i++) {
+                Array<int> vertices;
+                source_mesh->GetBdrElementVertices(i, vertices);
+                for (int j = 0; j < vertices.Size(); j++) {
+                    int vdof = vertices[j];
+                    double node_coords[3];
+                    source_mesh->GetNode(vdof, node_coords);
                     
-                    for (int j = 0; j < vertices.Size(); j++) {
-                        int vdof = vertices[j];
-                        double node_coords[3];
-                        source_mesh->GetNode(vdof, node_coords);
-                        
-                        double dist = 0.0;
-                        for (int k = 0; k < 3; k++) {
-                            dist += (node_coords[k] - coords[k]) * (node_coords[k] - coords[k]);
-                        }
-                        
-                        if (sqrt(dist) < spatial_tol) {
-                            bp.value = (*source_gf)(vdof);
-                            break;
-                        }
+                    double dist_sq = 0.0;
+                    for (int k = 0; k < 3; k++) {
+                        dist_sq += (node_coords[k] - bp.coords[k]) * (node_coords[k] - bp.coords[k]);
+                    }
+                    
+                    if (sqrt(dist_sq) < spatial_tol) {
+                        local_updated_values.push_back((*source_gf)(vdof));
+                        found = true;
+                        break;
                     }
                 }
+                if (found) break;
             }
         }
-        
-        // 广播更新后的值
-        for (int rank = 0; rank < global_boundary_points.size(); rank++) {
-            MPI_Bcast(&global_boundary_points[rank].value, 1, MPI_DOUBLE, 
-                     global_boundary_points[rank].owner_rank, MPI_COMM_WORLD);
-        }
+    }
+
+    // 阶段二：使用一次Allgatherv来分发所有更新的值
+    std::vector<double> global_updated_values(global_boundary_points.size());
+    
+    MPI_Allgatherv(
+        local_updated_values.data(),           // 发送缓冲区 (本地更新的值)
+        local_updated_values.size(),           // 发送数量
+        MPI_DOUBLE,                            // 发送类型
+        global_updated_values.data(),          // 接收缓冲区 (全局所有值)
+        points_counts_per_rank_.data(),        // 每个进程接收多少 (已缓存)
+        points_disps_per_rank_.data(),         // 接收数据的位移 (已缓存)
+        MPI_DOUBLE,                            // 接收类型
+        MPI_COMM_WORLD
+    );
+
+    // 阶段三：用收到的全局最新值更新本地的 `global_boundary_points` 列表
+    // 因为 Allgatherv 收集数据的顺序(按rank 0, 1, 2...)与 global_boundary_points
+    // 最初建立时的顺序是一致的，所以可以直接按索引赋值。
+    for (size_t i = 0; i < global_boundary_points.size(); ++i) {
+        global_boundary_points[i].value = global_updated_values[i];
+    }
     }
     
     // 获取目标点的值
@@ -580,8 +607,8 @@ visit_dc.SetPrefixPath(data_path);
     pmesh = dynamic_cast<ParMesh*>(visit_dc.GetMesh());
 
     int ne_before_ = pmesh->GetNE();
-pmesh->UniformRefinement();
-pmesh->UniformRefinement();
+//pmesh->UniformRefinement();
+//pmesh->UniformRefinement();
 //pmesh->UniformRefinement();
 int ne_after_ = pmesh->GetNE();
 
@@ -609,8 +636,8 @@ if (my_rank == 0) {
     // 验证细化前后的单元数量
 int ne_before = pmesh_torso->GetNE();
 //pmesh_torso->UniformRefinement();
-pmesh_torso->UniformRefinement();
-pmesh_torso->UniformRefinement();
+//pmesh_torso->UniformRefinement();
+//pmesh_torso->UniformRefinement();
 int ne_after = pmesh_torso->GetNE();
 
 if (my_rank == 0) {
@@ -1018,6 +1045,7 @@ else
    //pcg_monodomain_petsc->SetAbsTol(1e-12);
    pcg_monodomain_petsc->SetMaxIter(1000);
    pcg_monodomain_petsc->SetPrintLevel(2);
+    pcg_monodomain_petsc->iterative_mode = true; 
 }
    EndTimer();
 
@@ -1388,6 +1416,7 @@ t_ionic_start = MPI_Wtime();
     }
     else
     {
+        
         pcg_monodomain_petsc->Mult(actual_b, actual_Vm);
                 int current_iterations = pcg_monodomain_petsc->GetNumIterations();
     total_iterations_monodomain += current_iterations;
@@ -1491,18 +1520,27 @@ if (solve_torso_model  && pmesh_torso && pfespace_torso && gf_ue_torso) {
        std::cout << "\n===== 求解Torso模型 =====\n" << std::endl;
    }
    
+double t_boundary_start_1, t_boundary_end_1, t_boundary_duration_1;
+double t_boundary_start_2, t_boundary_end_2, t_boundary_duration_2;
+t_boundary_start_1 = MPI_Wtime();
 
  parallel_transfer->UpdateBoundaryValues();
-
-
+ t_boundary_end_1 = MPI_Wtime();
+t_boundary_duration_1 = t_boundary_end_1 - t_boundary_start_1;
 
     b_plf_torso->Assemble();
 
+    t_boundary_start_2 = MPI_Wtime();
+  // 应用边界条件 - 仅在Dirichlet边界上使用心脏网格的值
+    gf_ue_torso->ProjectBdrCoefficient(*bdr_coef, ess_bdr_torso);
 
+ t_boundary_end_2 = MPI_Wtime();
+t_boundary_duration_2 = t_boundary_end_2 - t_boundary_start_2;
 
-        // 应用边界条件 - 仅在Dirichlet边界上使用心脏网格的值
-        gf_ue_torso->ProjectBdrCoefficient(*bdr_coef, ess_bdr_torso);
-
+if (my_rank == 0) {
+    std::cout << "UpdateBoundaryValues 运行时间: " << t_boundary_duration_1 << " 秒" << std::endl;
+    std::cout << "ProjectBdrCoefficient 运行时间: " << t_boundary_duration_2 << " 秒" << std::endl;
+}
 
 
 
