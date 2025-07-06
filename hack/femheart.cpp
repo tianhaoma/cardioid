@@ -43,6 +43,19 @@ const double DEFAULT_HEART_POTENTIAL = -83.0;  // 默认心脏电位值（仅作
 
 
 
+    bool isRealDof(ParFiniteElementSpace* pfespace, int i) {
+        return pfespace->GetLocalTDofNumber(i) >= 0;
+    }
+    
+    // 获取本地真实细胞的数量
+    int countRealCells(ParFiniteElementSpace* pfespace) {
+        int count = 0;
+        for (int i = 0; i < pfespace->GetVSize(); i++) {
+            if (isRealDof(pfespace, i)) count++;
+        }
+        return count;
+    }
+
 
 // 改进的CoordinateBasedTransfer类
 class ParallelCoordinateBasedTransfer {
@@ -648,10 +661,48 @@ if (my_rank == 0) {
 
 
    // Read shared global mesh
-   //mfem::Mesh *mesh = nullptr;
+   mfem::Mesh *mesh = nullptr;
+   int *pmeshpart = nullptr;
    if (my_rank == 0)
    {
-    //mesh = ecg_readMeshptr(obj, "mesh");
+    mesh = ecg_readMeshptr(obj, "mesh");
+
+    // --- 2. 读取分区文件 (partitioning.txt) ---
+    std::string part_filename = data_path + coll_name + "_000000" + "/partitioning.txt";
+    std::cout << "Rank 0: 正在尝试读取分区文件: " << part_filename << std::endl;
+
+    // --- 读取分区文件 ---
+    std::ifstream infile(part_filename);
+    if (!infile.is_open()) {
+        std::cerr << "错误：无法打开分区文件 '" << part_filename << "'！" << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, -1);
+    }
+
+    std::string label;
+    int num_elements_from_file;
+    int num_procs_from_file;
+
+    // 读取并验证文件头信息
+    infile >> label >> num_elements_from_file;
+    assert(label == "number_of_elements" && "分区文件格式错误：第一行应为 'number_of_elements'");
+    assert(num_elements_from_file == mesh->GetNE() && "分区文件中的单元数与网格文件不匹配！");
+
+    infile >> label >> num_procs_from_file;
+    assert(label == "number_of_processors" && "分区文件格式错误：第二行应为 'number_of_processors'");
+    assert(num_procs_from_file == num_ranks && "分区文件中的进程数与MPI启动的进程数不匹配！");
+
+    // 分配内存并读取分区数据
+    pmeshpart = new int[mesh->GetNE()];
+    for (int i = 0; i < mesh->GetNE(); i++) {
+        if (!(infile >> pmeshpart[i])) {
+            std::cerr << "错误：读取分区数据时文件提前结束或格式错误！" << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, -1);
+        }
+    }
+    
+    infile.close();
+    std::cout << "Rank 0: 分区文件加载成功。" << std::endl;
+
    }
    //mfem::Mesh *mesh = ecg_readMeshptr(obj, "mesh");
    EndTimer();
@@ -701,8 +752,8 @@ if (my_rank == 0) {
    double Cm;
    objectGet(obj,"Cm",Cm,"0.01"); // 1 uF/cm^2 = 0.01 uF/mm^2
  
-   std::string reactionName;
-   objectGet(obj, "reaction", reactionName, "BetterTT06");
+   //std::string reactionName;
+   //objectGet(obj, "reaction", reactionName, "BetterTT06");
 
    std::string outputDir;
    objectGet(obj, "outdir", outputDir, ".");
@@ -1049,17 +1100,14 @@ else
 }
    EndTimer();
 
-
-
-
-
-
-
-
    //Set up the ionic models
    ParLinearForm *c = new ParLinearForm(pfespace);
    //positive dt here because the reaction models use dVm = -Iion
    c->AddDomainIntegrator(new DomainLFIntegrator(stims));
+
+
+
+
 
 
    
@@ -1070,18 +1118,127 @@ else
    objectGet(obj, "reaction", reactionNames);
    //reactionNames.push_back(reactionName);
    std::vector<int> cellTypes;
+   std::vector<int> realDofIndices;
+
+
+
+
 
    //int Iion_order = 2*order+3;
    int Iion_order = 2*order-1;
    QuadratureSpace quadSpace(pmesh, Iion_order);
    if (useNodalIion)
    {
-      //for (int ranklookup=local_extents[my_rank]; ranklookup<local_extents[my_rank+1]; ranklookup++)
-      for (int i = 0; i < pfespace->GetNE(); i++)
-      {
-         //cellTypes.push_back(material_from_ranklookup[ranklookup]);
-         cellTypes.push_back(1);
-      }
+    if (my_rank == 0)
+{
+    // --- 这一整块代码都只在 Rank 0 上执行 ---
+    
+    // 假设 rank 0 已经加载了全局网格 mesh 和分区数组 pmeshpart
+    // mfem::Mesh *mesh = ...;
+    // int *pmeshpart = ...; // 从 partitioning.txt 读取
+
+    // 1. Go through all the elements and label the partitioning for the vertices
+    std::vector<std::set<int>> pvertset(mesh->GetNV());
+    for (int ielem = 0; ielem < mesh->GetNE(); ielem++)
+    {
+        mfem::Array<int> verts;
+        mesh->GetElementVertices(ielem, verts);
+        for (int ivert = 0; ivert < verts.Size(); ivert++)
+        {
+            pvertset[verts[ivert]].insert(pmeshpart[ielem]);
+        }
+    }
+
+    // 2. 计算每个rank拥有的节点数量，并确定数据区段
+    std::vector<int> local_extents(num_ranks + 1);
+    std::vector<int> local_counts(num_ranks, 0); // 这个将用于MPI通信
+    {
+        for (int i = 0; i < mesh->GetNV(); i++)
+        {
+            if (!pvertset[i].empty())
+            {
+                local_counts[*(pvertset[i].begin())]++;
+            }
+        }
+
+        local_extents[0] = 0;
+        for (int irank = 0; irank < num_ranks; irank++)
+        {
+            local_extents[irank + 1] = local_extents[irank] + local_counts[irank];
+        }
+    }
+
+    // 3. Get the element material types for each index.
+    std::vector<int> material_from_ranklookup(local_extents[num_ranks]);
+    {
+        std::vector<int> element_from_globalvert(mesh->GetNV(), mesh->GetNE());
+        for (int ielem = 0; ielem < mesh->GetNE(); ielem++)
+        {
+            mfem::Array<int> verts;
+            mesh->GetElementVertices(ielem, verts);
+            for (int ivert = 0; ivert < verts.Size(); ivert++)
+            {
+                element_from_globalvert[verts[ivert]] = std::min(element_from_globalvert[verts[ivert]], ielem);
+            }
+        }
+        std::vector<int> cursor_ranklookup_from_rank = local_extents;
+        for (int i = 0; i < mesh->GetNV(); i++)
+        {
+            if (!pvertset[i].empty())
+            {
+                int irank = *(pvertset[i].begin());
+                int ranklookup = cursor_ranklookup_from_rank[irank]++;
+                int globalvert = i;
+                int ielem = element_from_globalvert[globalvert];
+                material_from_ranklookup[ranklookup] = mesh->GetElement(ielem)->GetAttribute();
+            }
+        }
+    }
+
+    // =======================================================================
+    // 阶段二：将计算结果分发给所有进程
+    // =======================================================================
+    
+    // 2a. 首先，通知每个进程它将接收多少数据
+    int my_cell_count; // Rank 0自己的count
+    MPI_Scatter(local_counts.data(), 1, MPI_INT, 
+                &my_cell_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    cellTypes.resize(my_cell_count); // Rank 0调整自己的cellTypes大小
+
+    // 2b. 然后，使用MPI_Scatterv分发主要数据
+    //     MPI_Scatterv用于发送不等长的数据到不同进程
+    MPI_Scatterv(material_from_ranklookup.data(), // 发送缓冲区 (包含所有数据的大向量)
+                 local_counts.data(),             // 每个进程要接收的数据个数
+                 local_extents.data(),            // 数据在发送缓冲区的位移
+                 MPI_INT,                         // 数据类型
+                 cellTypes.data(),                // 接收缓冲区 (Rank 0自己的部分)
+                 my_cell_count,                   // 接收数量
+                 MPI_INT,                         // 接收类型
+                 0,                               // 根进程ID
+                 MPI_COMM_WORLD);
+}
+else // 对于所有其他进程 (rank 1, 2, 3, ...)
+{
+    // =======================================================================
+    // 阶段二：非Rank 0进程负责接收数据
+    // =======================================================================
+
+    // 2a. 首先，从Rank 0接收自己需要的数据大小
+    int my_cell_count;
+    MPI_Scatter(nullptr, 1, MPI_INT, // 发送缓冲区为空
+                &my_cell_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // 根据接收到的大小，调整自己的cellTypes向量
+    cellTypes.resize(my_cell_count);
+
+    // 2b. 接收属于自己的那部分主要数据
+    MPI_Scatterv(nullptr, nullptr, nullptr, MPI_INT, // 发送相关参数均为空
+                 cellTypes.data(),                // 接收缓冲区
+                 my_cell_count,                   // 接收数量
+                 MPI_INT,                         // 接收类型
+                 0,                               // 根进程ID
+                 MPI_COMM_WORLD);
+}
    }
    else
    {
@@ -1100,9 +1257,34 @@ else
       }
    }
 
+
+   // ==================== 调试代码开始 ====================
+   if (my_rank == 4) // MPI rank从0开始，所以第5个rank是4
+   {
+       // 使用 map 来统计每种 cellType 出现的次数
+       std::map<int, int> type_counts;
+       for (int type : cellTypes) {
+           type_counts[type]++;
+       }
+
+       // 打印统计结果
+       printf("--- DEBUG: Rank 4 CellType Report ---\n");
+       if (type_counts.empty()) {
+           printf("Rank 4 has no cells assigned to it.\n");
+       } else {
+           for (auto const& [type, count] : type_counts) {
+               printf("  -> Found cell type %d, count: %d\n", type, count);
+           }
+       }
+       printf("---------------------------------------\n");
+   }
+   // ==================== 调试代码结束 ====================
+
+
+
    ReactionWrapper reactionWrapper(dt,reactionNames,defaultGroup,cellTypes);
    reactionWrapper.Initialize();
-   cellTypes.clear();
+   //cellTypes.clear();
    reactionNames.clear();
    
    ParBilinearForm *Iion_blf;
@@ -1314,6 +1496,35 @@ paraview_dc.RegisterField("ue", &gf_ue);
 paraview_dc.SetDataFormat(VTKFormat::ASCII);
 paraview_dc.SetCycle(0);
 paraview_dc.SetTime(0.0);
+
+// =======================================
+// ==================== 可视化cellTypes的调试代码 ====================
+
+// 1. 创建一个新的网格函数，其数据结构与 Vm 完全对齐
+ParGridFunction gf_celltypes_check(pfespace);
+
+// 2. 将我们最终生成的 cellTypes 向量的值，赋给这个新的网格函数
+//    循环的上限必须是 cellTypes.size()，也就是真自由度的数量
+for (int i = 0; i < cellTypes.size(); i++)
+{
+    // gf_celltypes_check 的索引 i 与 cellTypes 的索引 i 完全对应
+    gf_celltypes_check(i) = cellTypes[i];
+}
+
+// 3. (可选但推荐) 将所有“影子节点”(Ghost DOFs)赋值为一个特殊值，如 -1
+//    这样可以在可视化结果中清晰地看到各个MPI进程(rank)的分区边界
+for (int i = pfespace->GetTrueVSize(); i < gf_celltypes_check.Size(); i++)
+{
+    gf_celltypes_check(i) = -1.0;
+}
+
+// 4. 将这个新的数据场注册到ParaView数据收集中，以便保存到文件
+paraview_dc.RegisterField("CellTypes_Check", &gf_celltypes_check);
+
+// =================================================================
+
+
+// =============================================================
 
 ParaViewDataCollection paraview_dc_torso("torso_data", pmesh_torso);
 paraview_dc_torso.SetPrefixPath(outputDir);
@@ -1708,7 +1919,7 @@ delete pcg_hypre;
 delete precond_hypre;
 delete pcg_petsc;
 
-delete pfespace_vec;
+//delete pfespace_vec;
 
 
 MFEMFinalizePetsc();

@@ -113,7 +113,7 @@ set (reaction_src
 	#TT06Tau.cc
 	#TT06Func.cc
         BetterTT06.cc
-        #Grandi.cc
+        Grandi.cc
 	#pade.cc
 )
 
