@@ -519,8 +519,10 @@ int main(int argc, char *argv[])
 {
    MPI_Init(NULL,NULL);
    int num_ranks, my_rank;
+
    MPI_Comm_size(COMM_LOCAL,&num_ranks);
    MPI_Comm_rank(COMM_LOCAL,&my_rank);
+
 
    units_internal(1e-3, 1e-9, 1e-3, 1e-3, 1, 1e-9, 1);
    units_external(1e-3, 1e-9, 1e-3, 1e-3, 1, 1e-9, 1);
@@ -1700,7 +1702,7 @@ if (pcg_monodomain_petsc) delete pcg_monodomain_petsc;
 //if (transfer) delete transfer;
 if (parallel_transfer) delete parallel_transfer;
 if (bdr_coef) delete bdr_coef;
-delete torso_fec; // 此行未出现在清理代码中
+
 
 if (a_pblf_torso) delete a_pblf_torso;
 if (b_plf_torso) delete b_plf_torso;
