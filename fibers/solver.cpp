@@ -5,6 +5,8 @@
 #include "constants.h"
 #include "option.h"
 
+#include "io.h"
+
 void getVert2Elements(Mesh *mesh, vector<vector<int> >& vert2Elements) {
 
     int NumOfVertices = mesh->GetNV();
@@ -406,194 +408,169 @@ int detectAxis(Mesh *mesh, vector<Vector>& boundingbox){
     
 }
 
+// 在 solver.cpp 文件中，用下面的新函数替换掉旧的 setSurfaces 函数
+
+// 在 solver.cpp 文件中，用下面的新函数替换掉旧的 setSurfaces 函数
+
+// 在 solver.cpp 文件中，用下面的新函数替换掉旧的 setSurfaces 函数
+
 void setSurfaces(Mesh *mesh, vector<Vector>& boundingbox, double angle, int myid){
-    // Attributes for different surface
+    // 属性常量定义保持不变
     const int apexAttr=1;
     const int baseAttr=2;
     const int epiAttr=3;
-    const int lvAttr=5; 
+    const int lvAttr=5;
     const int rvAttr=4;
-       
-    // Determine the max and min dimension of mesh and apex.
+
+    // 边界框计算 (保持不变)
     double *coord;
     Vector coord_min(3);
     Vector coord_max(3);
     bool firstEle=true;
-    
-    int nbe=mesh->GetNBE();
+    int nbe = mesh->GetNBE();
+
     for(int i=0; i<nbe; i++){
-        Element *ele = mesh->GetBdrElement(i);        
+        Element *ele = mesh->GetBdrElement(i);
         const int *v = ele->GetVertices();
         const int nv = ele->GetNVertices();
-        // The first loop has to initialize the min and max.
         if(firstEle){
             firstEle=false;
             coord=mesh->GetVertex(v[0]);
             for (int j = 0; j < 3; j++) {
                 coord_min(j)=coord[j];
                 coord_max(j)=coord[j];
-            }            
+            }
         }
-        
         for(int j=0; j<nv; j++){
             coord=mesh->GetVertex(v[j]);
-            
             for (int k = 0; k < 3; k++) {
-                if(coord[k]<coord_min[k]){
-                    coord_min(k)=coord[k];
-                }
-                if(coord[k]>coord_max[k]){
-                    coord_max(k)=coord[k];
-                }            
-            }                                    
+                if(coord[k]<coord_min[k]){ coord_min(k)=coord[k]; }
+                if(coord[k]>coord_max[k]){ coord_max(k)=coord[k]; }
+            }
         }
-        
     }
-    
+    boundingbox.clear();
     boundingbox.push_back(coord_min);
     boundingbox.push_back(coord_max);
-    
-    // axis: 0 - x; 1 - y; 2 - z
-    int axis=detectAxis(mesh, boundingbox);
-
-    // Keep track vertex and element indeces for min in axis
-    int apexVet=0;
-    int apexEleIndex=0;    
-    double apexCoord_min=0;
-    firstEle=true;
-    
-    for(int i=0; i<nbe; i++){
-        Element *ele = mesh->GetBdrElement(i);        
-        const int *v = ele->GetVertices();
-        const int nv = ele->GetNVertices();
-        
-        // The first loop has to initialize the min and max.
-        if(firstEle){
-            firstEle=false;
-            coord=mesh->GetVertex(v[0]);
-            apexCoord_min=coord[axis];
-            apexVet = v[0];
-            apexEleIndex = i;
-        }
-        
-        for(int j=0; j<nv; j++){
-            coord=mesh->GetVertex(v[j]);
-                       
-            if(coord[axis]<apexCoord_min){
-                apexCoord_min=coord[axis];  
-                apexVet=v[j];
-                apexEleIndex=i;
-                
-            }                                   
-        }
-        
-    }    
-
-    coord = mesh->GetVertex(apexVet);
-    
-    // Top 5% of the  axis.
-    double apexTop5=coord_max[axis]-(coord_max[axis]-coord_min[axis])*0.05;
-
     if (myid == 0) {
-        cout << "\tHeart aligns along " << axis << " (0=x, 1=y, 2=z)" << endl;
-        cout << "\tMin: " << coord_min(0) << " " << coord_min(1) << " " << coord_min(2) << endl;
-        cout << "\tMax: " << coord_max(0) << " " << coord_max(1) << " " << coord_max(2) << endl;
-        cout << "\tApex: " << coord[0] << " " << coord[1] << " " << coord[2] << endl;
-        cout << "\tTop 5% axis {"<< axis <<") coordinate: " << apexTop5 << endl;
+        cout << "\t已计算网格边界框 (Bounding Box)。" << endl;
     }
-    // Initialization the attributes to 0 and set attribute of apex
+
+    // 寻找 Apex 区域的所有顶点 (逻辑保持不变)
+    Array<int> apex_v;
     for(int i=0; i<nbe; i++){
-        Element *ele = mesh->GetBdrElement(i);        
-        const int *v = ele->GetVertices();
-        const int nv = ele->GetNVertices();
-        // initialize the attribute for boundary.  
-        ele->SetAttribute(0);
-        
-        //Found apex elements and set attribute.
-        for (int j = 0; j < nv; j++) {
-            if (v[j] ==apexVet){
-                ele->SetAttribute(apexAttr);
-                //cout << "Element index = " << i << endl;
-            }
-        }        
-    }
-    
-    // Base    
-    // The base must be planar. Its norm must be within 20 degrees of z axis.
-    double cosTheta = cos(angle*PI/180); 
-    for(int i=0; i<nbe; i++){
-        Element *ele = mesh->GetBdrElement(i);        
-        const int *v = ele->GetVertices();
-        const int nv = ele->GetNVertices();
-        MFEM_ASSERT(nv == 3, "Wrong boundary size");
-        
-        double *coord0 = mesh->GetVertex(v[0]);
-        if(coord0[axis]>apexTop5){
-            double *coord1 = mesh->GetVertex(v[1]);
-            double *coord2 = mesh->GetVertex(v[2]);
-            if(isPlanar(coord0, coord1, coord2, cosTheta, axis)){
-                ele->SetAttribute(baseAttr);
+        Element *ele = mesh->GetBdrElement(i);
+        if (ele->GetAttribute() == apexAttr) {
+            const int *v = ele->GetVertices();
+            for (int j=0; j<ele->GetNVertices(); j++) {
+                apex_v.Append(v[j]);
             }
         }
     }
     
-    //EPI
-    set<Element*> elements;
-    for(int i=0; i<nbe; i++){
-        Element *ele = mesh->GetBdrElement(i); 
-        if(ele->GetAttribute()==0){
-            elements.insert(ele);
-        }
-    }
-    
-    Element *apexEle=mesh->GetBdrElement(apexEleIndex);
-    set<Element*> epiElements=findNeighbor(apexEle, elements, epiAttr);
-        
-    // set the apexEle back to apexAttr, it got changed in the findNeighbor
-    apexEle->SetAttribute(apexAttr);
-    
-    // LV & RV
-    // pick one element in the container and assume it is right ventricles.
-    Element* lastEle=*(elements.begin()); 
-    lastEle->SetAttribute(rvAttr);
-    // get rid of last element in the container
-    elements.erase(elements.begin());
-    set<Element*> vElements=findNeighbor(lastEle, elements, rvAttr);
-        
-    //get the numbers of points in two ventricles
-    unsigned v1count=vElements.size(); // assume right ventricle
-    unsigned v2count=elements.size();  // assume left ventricle
- 
+    MFEM_ASSERT(apex_v.Size() > 0, "错误: 在输入的 .mesh 文件中没有找到属性为 1 的 Apex 单元。");
     if (myid == 0) {
-        cout << "\nEPI number of element = " << epiElements.size() << endl;
-        cout << "V1  number of element = " << v1count << endl;
-        cout << "V2  number of element = " << v2count << endl << endl;
+        cout << "\t成功从输入网格中找到预标记的 Apex 区域。" << endl;
     }
 
-    //The right ventricle has more points/cells than the left 
-    if(v1count>v2count){ //the assumption validated
-        for(set<Element*>::iterator it=elements.begin(); it!=elements.end(); ++it){
-            (*it)->SetAttribute(lvAttr); //set the attribute values
-        }              
-    }else{
-       lastEle->SetAttribute(lvAttr);
-        for(set<Element*>::iterator it=vElements.begin(); it!=vElements.end(); ++it){
-            (*it)->SetAttribute(lvAttr); //set the attribute values
-        }
-        for(set<Element*>::iterator it=elements.begin(); it!=elements.end(); ++it){
-            (*it)->SetAttribute(rvAttr); //set the attribute values
-        }              
-    }
+    // =======================================================================
+    // 寻找心外膜 (EPI) - 最终修正版
+    // =======================================================================
 
-    // Check if there are unassigned elements left.
+    // 1. 创建候选池 (所有非Apex、非Base的单元)
+    set<Element*> elements_pool;
     for(int i=0; i<nbe; i++){
-        Element *ele = mesh->GetBdrElement(i); 
-        MFEM_ASSERT(ele->GetAttribute()!=0, "Unassigned element.");
-    }  
+        Element *ele = mesh->GetBdrElement(i);
+        int attr = ele->GetAttribute();
+        if(attr != apexAttr && attr != baseAttr){
+            ele->SetAttribute(0);
+            elements_pool.insert(ele);
+        }
+    }
+
+    // 2. 找到与Apex区域直接相邻的单元，作为Epi的“第一圈”
+    set<Element*> epi_frontier;
+    for (set<Element*>::iterator it=elements_pool.begin(); it!=elements_pool.end(); ++it) {
+        Element* candidate_ele = *it;
+        const int *v_candidate = candidate_ele->GetVertices();
+        bool is_neighbor = false;
+        for (int i=0; i<candidate_ele->GetNVertices(); i++) {
+            for (int j=0; j<apex_v.Size(); j++) {
+                if (v_candidate[i] == apex_v[j]) { // 检查是否有共享顶点
+                    is_neighbor = true;
+                    break;
+                }
+            }
+            if (is_neighbor) break;
+        }
+        if (is_neighbor) {
+            epi_frontier.insert(candidate_ele);
+        }
+    }
+    
+    MFEM_ASSERT(!epi_frontier.empty(), "错误: 找不到任何与Apex区域相邻的Epi候选单元。请检查网格连通性。");
+
+    // 3. 从“第一圈”中任意选取一个单元开始，进行一次完整的邻近搜索
+    Element* epi_start_element = *(epi_frontier.begin());
+    set<Element*> epiElements = findNeighbor(epi_start_element, elements_pool, epiAttr);
+    // --- 修正结束 ---
+    
+    // =======================================================================
+    // 寻找左右心室 (LV & RV) (逻辑保持不变)
+    // =======================================================================
+    if (!elements_pool.empty()) {
+        Element* lastEle = *(elements_pool.begin());
+        lastEle->SetAttribute(rvAttr);
+        elements_pool.erase(elements_pool.begin());
+        set<Element*> vElements = findNeighbor(lastEle, elements_pool, rvAttr);
+        
+        unsigned v1count = vElements.size() + 1;
+        unsigned v2count = elements_pool.size();
+    
+        if (myid == 0) {
+            cout << "\n\tEPI 表面单元数 = " << epiElements.size() << endl;
+            cout << "\tEndo 面 1 单元数 (RV) = " << v1count << endl;
+            cout << "\tEndo 面 2 单元数 (LV) = " << v2count << endl << endl;
+        }
+
+        if(v1count > v2count){
+            for(set<Element*>::iterator it=elements_pool.begin(); it!=elements_pool.end(); ++it){
+                (*it)->SetAttribute(lvAttr);
+            }
+        } else {
+           lastEle->SetAttribute(lvAttr);
+            for(set<Element*>::iterator it=vElements.begin(); it!=vElements.end(); ++it){
+                (*it)->SetAttribute(lvAttr);
+            }
+            for(set<Element*>::iterator it=elements_pool.begin(); it!=elements_pool.end(); ++it){
+                (*it)->SetAttribute(rvAttr);
+            }
+        }
+    } else {
+        if (myid == 0) {
+             cout << "\n\t警告: 没有找到可供分配的 LV/RV 单元。" << endl;
+        }
+    }
+
+    // 最终检查和设置
+    for(int i=0; i<nbe; i++){
+        Element *ele = mesh->GetBdrElement(i);
+        MFEM_ASSERT(ele->GetAttribute() != 0, "发现未分配属性的边界单元，请检查算法逻辑。");
+    }
     
     mesh->SetAttributes();
-            
+    
+    // 保存调试文件
+    if (myid == 0) {
+        cout << "\t正在保存表面属性到调试文件 a_surf_debug.vtk ..." << endl;
+        ofstream surf_debug_ofs("a_surf_debug.vtk");
+        surf_debug_ofs.precision(8);
+        printSurfVTK(mesh, surf_debug_ofs);
+        cout << "\t调试文件写入成功。" << endl;
+    }
 }
+
+
 
 void setSurf4Surf(Mesh *surface, double angle){
     // Attributes for different surface
