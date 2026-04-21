@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include <mpi.h> // Include MPI header
 #include <iomanip> // For formatted output
@@ -44,364 +45,683 @@ const double DEFAULT_HEART_POTENTIAL = -83.0;  // 默认心脏电位值（仅作
 
 
 
-// 改进的CoordinateBasedTransfer类
-class ParallelCoordinateBasedTransfer {
+// 调试版 heart -> torso 边界传输类。
+// 设计目标：
+// 1) 不做全局边界点副本；
+// 2) 不使用 MPI_Alltoall / MPI_Alltoallv；
+// 3) 每个 phase 都用 "root 只收元数据 + 稀疏点对点 payload" 的闭合协议；
+// 4) 为 SparseExchangeViaRootMeta 提供充分的调试插桩，便于定位 1536/3072 ranks 下的通信不匹配。
+//
+// [FIX] 2024: 将 root 顺序 Send/Recv 分发元数据改为 MPI_Scatter/Scatterv，
+//       消除大规模并行下的死锁风险和 O(P) 串行瓶颈。
+class HeartTorsoBoundaryTransfer {
 private:
-    ParMesh* source_mesh;
-    ParFiniteElementSpace* source_fes;
-    ParGridFunction* source_gf;
-    
-    const double spatial_tol = 1e-8;
-    
-    // 存储全局边界点信息
-    struct GlobalBoundaryPoint {
+    struct InterfacePointRecord {
         double coords[3];
-        double value;
-        int owner_rank;  // 拥有该点的进程
-        
-        GlobalBoundaryPoint() {}
-        GlobalBoundaryPoint(double x, double y, double z, double v, int rank) 
-            : value(v), owner_rank(rank) {
-            coords[0] = x; coords[1] = y; coords[2] = z;
+        int home_rank;
+        int local_id;
+    };
+
+    struct MatchProposal {
+        int torso_home_rank;
+        int torso_local_id;
+        int heart_home_rank;
+        int heart_local_id;
+        double dist2;
+    };
+
+    struct ValueRequest {
+        int torso_home_rank;
+        int torso_local_id;
+        int heart_local_id;
+    };
+
+    struct MetaEntry {
+        int peer;
+        int count;
+    };
+
+    struct QuantizedKey {
+        long long ix;
+        long long iy;
+        long long iz;
+
+        bool operator==(const QuantizedKey& other) const {
+            return ix == other.ix && iy == other.iy && iz == other.iz;
         }
     };
-    
-    std::vector<GlobalBoundaryPoint> global_boundary_points;
 
-    // 用来存储每个进程拥有的边界点数量
-    std::vector<int> points_counts_per_rank_; 
-    // 用来存储Allgatherv需要的位移信息
-    std::vector<int> points_disps_per_rank_;  
-    
-public:
-    ParallelCoordinateBasedTransfer(ParMesh* src_mesh, ParFiniteElementSpace* src_fes, 
-                                  ParGridFunction* src_gf)
-        : source_mesh(src_mesh), source_fes(src_fes), source_gf(src_gf) {
-        BuildGlobalBoundaryPointsMap();
+    struct QuantizedKeyHash {
+        std::size_t operator()(const QuantizedKey& key) const {
+            std::size_t h1 = std::hash<long long>{}(key.ix);
+            std::size_t h2 = std::hash<long long>{}(key.iy);
+            std::size_t h3 = std::hash<long long>{}(key.iz);
+            return h1 ^ (h2 << 1) ^ (h3 << 2);
+        }
+    };
+
+    ParMesh* heart_mesh_;
+    ParFiniteElementSpace* heart_fes_;
+    ParGridFunction* heart_gf_;
+
+    ParMesh* torso_mesh_;
+    ParFiniteElementSpace* torso_fes_;
+    ParGridFunction* torso_gf_;
+
+    double spatial_tol_;
+    int my_rank_;
+    int num_ranks_;
+
+    double global_xmin_;
+    double global_xmax_;
+
+    std::vector<int> local_torso_dirichlet_vdofs_;
+
+    std::vector<int> send_peers_;
+    std::vector<std::vector<int> > send_heart_local_ids_per_peer_;
+
+    std::vector<int> recv_peers_;
+    std::vector<std::vector<int> > recv_torso_local_ids_per_peer_;
+
+    std::vector<int> self_heart_local_ids_;
+    std::vector<int> self_torso_local_ids_;
+
+    static QuantizedKey MakeQuantizedKey(const double* coords, double tol,
+                                         int dx = 0, int dy = 0, int dz = 0)
+    {
+        QuantizedKey key;
+        key.ix = static_cast<long long>(std::llround(coords[0] / tol)) + dx;
+        key.iy = static_cast<long long>(std::llround(coords[1] / tol)) + dy;
+        key.iz = static_cast<long long>(std::llround(coords[2] / tol)) + dz;
+        return key;
     }
-    
-    // 构建全局边界点映射
-    void BuildGlobalBoundaryPointsMap() {
-        int my_rank, num_procs;
-        MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
-        
-        // 步骤1：收集本地边界点
-        std::vector<GlobalBoundaryPoint> local_boundary_points;
-        std::set<int> processed_vertices;  // 避免重复处理顶点
-        
-        for (int i = 0; i < source_mesh->GetNBE(); i++) {
+
+    static double DistanceSquared(const double* a, const double* b)
+    {
+        const double dx = a[0] - b[0];
+        const double dy = a[1] - b[1];
+        const double dz = a[2] - b[2];
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    static MPI_Datatype BuildPointRecordMPIType()
+    {
+        MPI_Datatype mpi_type;
+        const int nitems = 3;
+        int blocklengths[3] = {3, 1, 1};
+        MPI_Datatype types[3] = {MPI_DOUBLE, MPI_INT, MPI_INT};
+        MPI_Aint offsets[3];
+
+        InterfacePointRecord dummy;
+        MPI_Aint base_address;
+        MPI_Get_address(&dummy, &base_address);
+        MPI_Get_address(&dummy.coords[0], &offsets[0]);
+        MPI_Get_address(&dummy.home_rank, &offsets[1]);
+        MPI_Get_address(&dummy.local_id, &offsets[2]);
+        for (int i = 0; i < nitems; i++) { offsets[i] -= base_address; }
+
+        MPI_Type_create_struct(nitems, blocklengths, offsets, types, &mpi_type);
+        MPI_Type_commit(&mpi_type);
+        return mpi_type;
+    }
+
+    static MPI_Datatype BuildMatchProposalMPIType()
+    {
+        MPI_Datatype mpi_type;
+        const int nitems = 5;
+        int blocklengths[5] = {1, 1, 1, 1, 1};
+        MPI_Datatype types[5] = {MPI_INT, MPI_INT, MPI_INT, MPI_INT, MPI_DOUBLE};
+        MPI_Aint offsets[5];
+
+        MatchProposal dummy;
+        MPI_Aint base_address;
+        MPI_Get_address(&dummy, &base_address);
+        MPI_Get_address(&dummy.torso_home_rank, &offsets[0]);
+        MPI_Get_address(&dummy.torso_local_id, &offsets[1]);
+        MPI_Get_address(&dummy.heart_home_rank, &offsets[2]);
+        MPI_Get_address(&dummy.heart_local_id, &offsets[3]);
+        MPI_Get_address(&dummy.dist2, &offsets[4]);
+        for (int i = 0; i < nitems; i++) { offsets[i] -= base_address; }
+
+        MPI_Type_create_struct(nitems, blocklengths, offsets, types, &mpi_type);
+        MPI_Type_commit(&mpi_type);
+        return mpi_type;
+    }
+
+    static MPI_Datatype BuildValueRequestMPIType()
+    {
+        MPI_Datatype mpi_type;
+        const int nitems = 3;
+        int blocklengths[3] = {1, 1, 1};
+        MPI_Datatype types[3] = {MPI_INT, MPI_INT, MPI_INT};
+        MPI_Aint offsets[3];
+
+        ValueRequest dummy;
+        MPI_Aint base_address;
+        MPI_Get_address(&dummy, &base_address);
+        MPI_Get_address(&dummy.torso_home_rank, &offsets[0]);
+        MPI_Get_address(&dummy.torso_local_id, &offsets[1]);
+        MPI_Get_address(&dummy.heart_local_id, &offsets[2]);
+        for (int i = 0; i < nitems; i++) { offsets[i] -= base_address; }
+
+        MPI_Type_create_struct(nitems, blocklengths, offsets, types, &mpi_type);
+        MPI_Type_commit(&mpi_type);
+        return mpi_type;
+    }
+
+    static MPI_Datatype BuildMetaEntryMPIType()
+    {
+        MPI_Datatype mpi_type;
+        const int nitems = 2;
+        int blocklengths[2] = {1, 1};
+        MPI_Datatype types[2] = {MPI_INT, MPI_INT};
+        MPI_Aint offsets[2];
+
+        MetaEntry dummy;
+        MPI_Aint base_address;
+        MPI_Get_address(&dummy, &base_address);
+        MPI_Get_address(&dummy.peer, &offsets[0]);
+        MPI_Get_address(&dummy.count, &offsets[1]);
+        for (int i = 0; i < nitems; i++) { offsets[i] -= base_address; }
+
+        MPI_Type_create_struct(nitems, blocklengths, offsets, types, &mpi_type);
+        MPI_Type_commit(&mpi_type);
+        return mpi_type;
+    }
+
+    void DebugLog(const std::string& msg) const
+    {
+        std::ostringstream oss;
+        oss << "transfer_debug_rank_" << std::setfill('0') << std::setw(6) << my_rank_ << ".log";
+        std::ofstream ofs(oss.str().c_str(), std::ios::app);
+        ofs << msg << std::endl;
+    }
+
+    int GeomOwner(const double* coords) const
+    {
+        const double denom = std::max(global_xmax_ - global_xmin_, 1e-30);
+        double xi = (coords[0] - global_xmin_) / denom;
+        int owner = static_cast<int>(std::floor(xi * num_ranks_));
+        if (owner < 0) { owner = 0; }
+        if (owner >= num_ranks_) { owner = num_ranks_ - 1; }
+        return owner;
+    }
+
+    void InitializeGlobalBBox()
+    {
+        double local_min[3] = { std::numeric_limits<double>::max(),
+                                std::numeric_limits<double>::max(),
+                                std::numeric_limits<double>::max() };
+        double local_max[3] = { -std::numeric_limits<double>::max(),
+                                -std::numeric_limits<double>::max(),
+                                -std::numeric_limits<double>::max() };
+
+        auto update_bbox = [&](ParMesh* mesh) {
+            for (int i = 0; i < mesh->GetNV(); i++) {
+                double c[3];
+                mesh->GetNode(i, c);
+                for (int d = 0; d < 3; d++) {
+                    local_min[d] = std::min(local_min[d], c[d]);
+                    local_max[d] = std::max(local_max[d], c[d]);
+                }
+            }
+        };
+
+        update_bbox(heart_mesh_);
+        update_bbox(torso_mesh_);
+
+        double global_min[3], global_max[3];
+        MPI_Allreduce(local_min, global_min, 3, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+        MPI_Allreduce(local_max, global_max, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        global_xmin_ = global_min[0];
+        global_xmax_ = global_max[0];
+    }
+
+    std::vector<InterfacePointRecord> CollectLocalHeartBoundaryPoints() const
+    {
+        std::vector<InterfacePointRecord> points;
+        std::set<int> processed_vertices;
+
+        for (int i = 0; i < heart_mesh_->GetNBE(); i++) {
             Array<int> vertices;
-            source_mesh->GetBdrElementVertices(i, vertices);
-            
+            heart_mesh_->GetBdrElementVertices(i, vertices);
             for (int j = 0; j < vertices.Size(); j++) {
                 int vdof = vertices[j];
-                
-                // 避免重复处理
-                if (processed_vertices.find(vdof) != processed_vertices.end()) {
-                    continue;
-                }
-                processed_vertices.insert(vdof);
-                
-                // 获取顶点坐标
-                double coords[3];
-                source_mesh->GetNode(vdof, coords);
-                
-                // 获取该顶点处的值
-                double value = (*source_gf)(vdof);
-                
-                // 创建边界点
-                local_boundary_points.emplace_back(
-                    coords[0], coords[1], coords[2], value, my_rank
-                );
+                if (!processed_vertices.insert(vdof).second) { continue; }
+
+                InterfacePointRecord rec;
+                heart_mesh_->GetNode(vdof, rec.coords);
+                rec.home_rank = my_rank_;
+                rec.local_id = vdof;
+                points.push_back(rec);
             }
         }
-        
-        // 步骤2：收集每个进程的边界点数量
-        int local_count = local_boundary_points.size();
-        std::vector<int> counts(num_procs);
-        MPI_Allgather(&local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-        
-        // 计算位移和总数
-        std::vector<int> displacements(num_procs);
-        int total_count = 0;
-        for (int i = 0; i < num_procs; i++) {
-            displacements[i] = total_count;
-            total_count += counts[i];
+        return points;
+    }
+
+    std::vector<InterfacePointRecord> CollectLocalTorsoDirichletPoints()
+    {
+        std::vector<InterfacePointRecord> points;
+        std::set<int> processed_vertices;
+        local_torso_dirichlet_vdofs_.clear();
+
+        for (int i = 0; i < torso_mesh_->GetNBE(); i++) {
+            if (torso_mesh_->GetBdrAttribute(i) != 100) { continue; }
+            Array<int> vertices;
+            torso_mesh_->GetBdrElementVertices(i, vertices);
+            for (int j = 0; j < vertices.Size(); j++) {
+                int vdof = vertices[j];
+                if (!processed_vertices.insert(vdof).second) { continue; }
+
+                InterfacePointRecord rec;
+                torso_mesh_->GetNode(vdof, rec.coords);
+                rec.home_rank = my_rank_;
+                rec.local_id = vdof;
+                points.push_back(rec);
+                local_torso_dirichlet_vdofs_.push_back(vdof);
+            }
         }
-        
-        // 步骤3：创建MPI数据类型用于GlobalBoundaryPoint
-        MPI_Datatype mpi_boundary_point_type;
+        return points;
+    }
+
+    static int FindBestHeartPoint(
+        const InterfacePointRecord& target,
+        const std::vector<InterfacePointRecord>& heart_points,
+        const std::unordered_map<QuantizedKey, std::vector<int>, QuantizedKeyHash>& bins,
+        double tol,
+        double& best_dist_sq)
+    {
+        const double tol_sq = tol * tol;
+        best_dist_sq = std::numeric_limits<double>::max();
+        int best_idx = -1;
+
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    QuantizedKey key = MakeQuantizedKey(target.coords, tol, dx, dy, dz);
+                    std::unordered_map<QuantizedKey, std::vector<int>, QuantizedKeyHash>::const_iterator it = bins.find(key);
+                    if (it == bins.end()) { continue; }
+                    for (size_t k = 0; k < it->second.size(); k++) {
+                        int idx = it->second[k];
+                        double d2 = DistanceSquared(target.coords, heart_points[idx].coords);
+                        if (d2 < best_dist_sq) {
+                            best_dist_sq = d2;
+                            best_idx = idx;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (best_idx >= 0 && best_dist_sq <= tol_sq) { return best_idx; }
+
+        for (size_t i = 0; i < heart_points.size(); i++) {
+            double d2 = DistanceSquared(target.coords, heart_points[i].coords);
+            if (d2 < best_dist_sq) {
+                best_dist_sq = d2;
+                best_idx = static_cast<int>(i);
+            }
+        }
+        return best_idx;
+    }
+
+    // =========================================================================
+    // [FIX v4] NBX (Non-blocking Barrier eXchange) 稀疏交换:
+    //   只在有实际数据的 rank 对之间建立 MPI 连接，避免 Alltoall/Alltoallv
+    //   在 1536 ranks 下耗尽 InfiniBand queue pairs。
+    //   算法: Hoefler et al., "Scalable Communication Protocols for
+    //          Dynamic Sparse Data Exchange", PPoPP 2010.
+    // =========================================================================
+    template <class T>
+    std::map<int, std::vector<T> > SparseExchangeViaRootMeta(
+        const std::map<int, std::vector<T> >& outgoing,
+        MPI_Datatype mpi_type,
+        int tag_data,
+        const std::string& phase_name) const
+    {
+        std::map<int, std::vector<T> > incoming;
+
+        // --- Step 1: Post all non-blocking sends (sparse, only to actual peers) ---
+        std::vector<MPI_Request> send_reqs;
+        for (typename std::map<int, std::vector<T> >::const_iterator it = outgoing.begin();
+             it != outgoing.end(); ++it)
         {
-            const int nitems = 3;
-            int blocklengths[3] = {3, 1, 1};
-            MPI_Datatype types[3] = {MPI_DOUBLE, MPI_DOUBLE, MPI_INT};
-            MPI_Aint offsets[3];
-            
-            GlobalBoundaryPoint dummy;
-            MPI_Aint base_address;
-            MPI_Get_address(&dummy, &base_address);
-            MPI_Get_address(&dummy.coords[0], &offsets[0]);
-            MPI_Get_address(&dummy.value, &offsets[1]);
-            MPI_Get_address(&dummy.owner_rank, &offsets[2]);
-            
-            for (int i = 0; i < nitems; i++) {
-                offsets[i] -= base_address;
+            if (it->second.empty()) { continue; }
+            if (it->first == my_rank_) {
+                // self-send: direct copy
+                incoming[my_rank_] = it->second;
+                continue;
             }
-            
-            MPI_Type_create_struct(nitems, blocklengths, offsets, types, 
-                                 &mpi_boundary_point_type);
-            MPI_Type_commit(&mpi_boundary_point_type);
+            MPI_Request r;
+            MPI_Issend(const_cast<T*>(it->second.data()),
+                       static_cast<int>(it->second.size()), mpi_type,
+                       it->first, tag_data, MPI_COMM_WORLD, &r);
+            send_reqs.push_back(r);
         }
-        
-        // 步骤4：收集所有边界点到所有进程
-        global_boundary_points.resize(total_count);
-        
-        MPI_Allgatherv(local_boundary_points.data(), local_count, mpi_boundary_point_type,
-                       global_boundary_points.data(), counts.data(), displacements.data(),
-                       mpi_boundary_point_type, MPI_COMM_WORLD);
-        
-        // 清理MPI类型
-        MPI_Type_free(&mpi_boundary_point_type);
 
-            // 将计算好并使用过的 counts 和 displacements 保存到成员变量中，以备后用
-    points_counts_per_rank_ = counts;
-    points_disps_per_rank_ = displacements;
+        // --- Step 2: Probe-recv loop with non-blocking barrier for termination ---
+        //   Phase A: probe & recv until all sends globally are matched (Ibarrier).
+        //   Phase B: after barrier, drain any remaining messages that arrived
+        //            between the last probe and barrier completion.
+        bool barrier_posted = false;
+        bool barrier_done = false;
+        MPI_Request barrier_req = MPI_REQUEST_NULL;
 
-        
-        if (my_rank == 0) {
-            std::cout << "全局边界点收集完成，总数: " << total_count << std::endl;
-        }
-    }
-    
-    // 更新边界值（不重建映射）
-    void UpdateBoundaryValues() {
-            int my_rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+        while (!barrier_done) {
+            // Probe for incoming messages with this tag
+            int flag = 0;
+            MPI_Status status;
+            MPI_Iprobe(MPI_ANY_SOURCE, tag_data, MPI_COMM_WORLD, &flag, &status);
 
-    // 阶段一：每个进程收集自己“拥有”的点的最新电势值
-    std::vector<double> local_updated_values;
-    // 使用预先存储的数量来预分配内存，提高效率
-    local_updated_values.reserve(points_counts_per_rank_[my_rank]); 
+            if (flag) {
+                int count = 0;
+                MPI_Get_count(&status, mpi_type, &count);
+                int src = status.MPI_SOURCE;
+                incoming[src].resize(count);
+                MPI_Recv(incoming[src].data(), count, mpi_type,
+                         src, tag_data, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                continue; // check for more messages before testing barrier
+            }
 
-    // 这个循环仍然需要遍历全局点来识别哪些是自己的
-    for (const auto& bp : global_boundary_points) {
-        if (bp.owner_rank == my_rank) {
-            // 注意：这里的本地搜索逻辑与原来相同，它本身也可能成为一个CPU瓶颈。
-            // 但我们当前的首要目标是解决通信瓶颈。
-            bool found = false;
-            for (int i = 0; i < source_mesh->GetNBE(); i++) {
-                Array<int> vertices;
-                source_mesh->GetBdrElementVertices(i, vertices);
-                for (int j = 0; j < vertices.Size(); j++) {
-                    int vdof = vertices[j];
-                    double node_coords[3];
-                    source_mesh->GetNode(vdof, node_coords);
-                    
-                    double dist_sq = 0.0;
-                    for (int k = 0; k < 3; k++) {
-                        dist_sq += (node_coords[k] - bp.coords[k]) * (node_coords[k] - bp.coords[k]);
-                    }
-                    
-                    if (sqrt(dist_sq) < spatial_tol) {
-                        local_updated_values.push_back((*source_gf)(vdof));
-                        found = true;
-                        break;
-                    }
+            // No pending message; check if we can post or test the barrier
+            if (!barrier_posted) {
+                // Post barrier only after all local sends are locally complete
+                int all_sent = 0;
+                if (send_reqs.empty()) {
+                    all_sent = 1;
+                } else {
+                    MPI_Testall(static_cast<int>(send_reqs.size()),
+                                send_reqs.data(), &all_sent, MPI_STATUSES_IGNORE);
                 }
-                if (found) break;
-            }
-        }
-    }
-
-    // 阶段二：使用一次Allgatherv来分发所有更新的值
-    std::vector<double> global_updated_values(global_boundary_points.size());
-    
-    MPI_Allgatherv(
-        local_updated_values.data(),           // 发送缓冲区 (本地更新的值)
-        local_updated_values.size(),           // 发送数量
-        MPI_DOUBLE,                            // 发送类型
-        global_updated_values.data(),          // 接收缓冲区 (全局所有值)
-        points_counts_per_rank_.data(),        // 每个进程接收多少 (已缓存)
-        points_disps_per_rank_.data(),         // 接收数据的位移 (已缓存)
-        MPI_DOUBLE,                            // 接收类型
-        MPI_COMM_WORLD
-    );
-
-    // 阶段三：用收到的全局最新值更新本地的 `global_boundary_points` 列表
-    // 因为 Allgatherv 收集数据的顺序(按rank 0, 1, 2...)与 global_boundary_points
-    // 最初建立时的顺序是一致的，所以可以直接按索引赋值。
-    for (size_t i = 0; i < global_boundary_points.size(); ++i) {
-        global_boundary_points[i].value = global_updated_values[i];
-    }
-    }
-    
-    // 获取目标点的值
-    double GetValueAtPoint(const Vector& point) {
-        double min_dist = std::numeric_limits<double>::max();
-        double closest_value = DEFAULT_HEART_POTENTIAL;
-        
-        for (const auto& bp : global_boundary_points) {
-            double dist = 0.0;
-            for (int i = 0; i < 3; i++) {
-                dist += (bp.coords[i] - point(i)) * (bp.coords[i] - point(i));
-            }
-            dist = sqrt(dist);
-            
-            if (dist < min_dist) {
-                min_dist = dist;
-                closest_value = bp.value;
-                
-                if (dist < spatial_tol) {
-                    return closest_value;
+                if (all_sent) {
+                    MPI_Ibarrier(MPI_COMM_WORLD, &barrier_req);
+                    barrier_posted = true;
+                }
+            } else {
+                int bdone = 0;
+                MPI_Test(&barrier_req, &bdone, MPI_STATUS_IGNORE);
+                if (bdone) {
+                    barrier_done = true;
                 }
             }
         }
-        
-        return closest_value;
+
+        // --- Step 3: Drain any remaining messages after barrier ---
+        // (messages sent before barrier but arriving after it completes)
+        while (true) {
+            int flag = 0;
+            MPI_Status status;
+            MPI_Iprobe(MPI_ANY_SOURCE, tag_data, MPI_COMM_WORLD, &flag, &status);
+            if (!flag) { break; }
+            int count = 0;
+            MPI_Get_count(&status, mpi_type, &count);
+            int src = status.MPI_SOURCE;
+            incoming[src].resize(count);
+            MPI_Recv(incoming[src].data(), count, mpi_type,
+                     src, tag_data, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+
+        // Ensure all sends are complete before returning (buffer safety)
+        if (!send_reqs.empty()) {
+            MPI_Waitall(static_cast<int>(send_reqs.size()),
+                        send_reqs.data(), MPI_STATUSES_IGNORE);
+        }
+
+        // --- Debug logging (optional, lightweight) ---
+        {
+            long long local_send = 0, local_recv = 0;
+            for (typename std::map<int, std::vector<T> >::const_iterator it = outgoing.begin();
+                 it != outgoing.end(); ++it) {
+                local_send += static_cast<long long>(it->second.size());
+            }
+            for (typename std::map<int, std::vector<T> >::const_iterator it = incoming.begin();
+                 it != incoming.end(); ++it) {
+                local_recv += static_cast<long long>(it->second.size());
+            }
+            long long global_send = 0, global_recv = 0;
+            MPI_Allreduce(&local_send, &global_send, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(&local_recv, &global_recv, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+            std::ostringstream oss;
+            oss << "[DBG] phase=" << phase_name
+                << " local_send=" << local_send
+                << " local_recv=" << local_recv
+                << " global_send=" << global_send
+                << " global_recv=" << global_recv;
+            DebugLog(oss.str());
+            if (global_send != global_recv && my_rank_ == 0) {
+                std::cerr << "[ERR] phase=" << phase_name
+                          << " global_send=" << global_send
+                          << " != global_recv=" << global_recv << std::endl;
+            }
+        }
+
+        return incoming;
+    }
+
+    void BuildInterfaceMap()
+    {
+        InitializeGlobalBBox();
+
+        if (my_rank_ == 0) { std::cout << "[XFER] begin collect local interface points" << std::endl; }
+        std::vector<InterfacePointRecord> local_heart_points = CollectLocalHeartBoundaryPoints();
+        std::vector<InterfacePointRecord> local_torso_points = CollectLocalTorsoDirichletPoints();
+        if (my_rank_ == 0) { std::cout << "[XFER] end   collect local interface points" << std::endl; }
+
+        MPI_Datatype point_type = BuildPointRecordMPIType();
+        MPI_Datatype match_type = BuildMatchProposalMPIType();
+        MPI_Datatype request_type = BuildValueRequestMPIType();
+
+        std::map<int, std::vector<InterfacePointRecord> > heart_to_owner;
+        for (size_t i = 0; i < local_heart_points.size(); i++) {
+            int owner = GeomOwner(local_heart_points[i].coords);
+            heart_to_owner[owner].push_back(local_heart_points[i]);
+        }
+
+        std::map<int, std::vector<InterfacePointRecord> > torso_to_owner;
+        for (size_t i = 0; i < local_torso_points.size(); i++) {
+            int owner = GeomOwner(local_torso_points[i].coords);
+            torso_to_owner[owner].push_back(local_torso_points[i]);
+        }
+
+        if (my_rank_ == 0) { std::cout << "[XFER] begin heart_to_owner" << std::endl; }
+        std::map<int, std::vector<InterfacePointRecord> > owner_received_heart =
+            SparseExchangeViaRootMeta(heart_to_owner, point_type, 8101, "heart_to_owner");
+        if (my_rank_ == 0) { std::cout << "[XFER] end   heart_to_owner" << std::endl; }
+
+        if (my_rank_ == 0) { std::cout << "[XFER] begin torso_to_owner" << std::endl; }
+        std::map<int, std::vector<InterfacePointRecord> > owner_received_torso =
+            SparseExchangeViaRootMeta(torso_to_owner, point_type, 8201, "torso_to_owner");
+        if (my_rank_ == 0) { std::cout << "[XFER] end   torso_to_owner" << std::endl; }
+
+        std::vector<InterfacePointRecord> owner_heart_points;
+        for (std::map<int, std::vector<InterfacePointRecord> >::const_iterator it = owner_received_heart.begin(); it != owner_received_heart.end(); ++it) {
+            owner_heart_points.insert(owner_heart_points.end(), it->second.begin(), it->second.end());
+        }
+        std::vector<InterfacePointRecord> owner_torso_points;
+        for (std::map<int, std::vector<InterfacePointRecord> >::const_iterator it = owner_received_torso.begin(); it != owner_received_torso.end(); ++it) {
+            owner_torso_points.insert(owner_torso_points.end(), it->second.begin(), it->second.end());
+        }
+
+        std::unordered_map<QuantizedKey, std::vector<int>, QuantizedKeyHash> heart_bins;
+        for (size_t i = 0; i < owner_heart_points.size(); i++) {
+            heart_bins[MakeQuantizedKey(owner_heart_points[i].coords, spatial_tol_)].push_back(static_cast<int>(i));
+        }
+
+        std::map<int, std::vector<MatchProposal> > matches_to_torso_home;
+        int local_unmatched = 0;
+        for (size_t i = 0; i < owner_torso_points.size(); i++) {
+            double best_dist_sq = 0.0;
+            int best_idx = FindBestHeartPoint(owner_torso_points[i], owner_heart_points, heart_bins, spatial_tol_, best_dist_sq);
+            if (best_idx < 0) {
+                local_unmatched++;
+                continue;
+            }
+            const InterfacePointRecord &hp = owner_heart_points[best_idx];
+            const InterfacePointRecord &tp = owner_torso_points[i];
+            MatchProposal mp;
+            mp.torso_home_rank = tp.home_rank;
+            mp.torso_local_id = tp.local_id;
+            mp.heart_home_rank = hp.home_rank;
+            mp.heart_local_id = hp.local_id;
+            mp.dist2 = best_dist_sq;
+            matches_to_torso_home[tp.home_rank].push_back(mp);
+        }
+
+        int global_unmatched = 0;
+        MPI_Allreduce(&local_unmatched, &global_unmatched, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        if (my_rank_ == 0) {
+            std::cout << "[XFER] owner matching unmatched points = " << global_unmatched << std::endl;
+        }
+
+        if (my_rank_ == 0) { std::cout << "[XFER] begin match_to_torso" << std::endl; }
+        std::map<int, std::vector<MatchProposal> > torso_received_matches =
+            SparseExchangeViaRootMeta(matches_to_torso_home, match_type, 8301, "match_to_torso");
+        if (my_rank_ == 0) { std::cout << "[XFER] end   match_to_torso" << std::endl; }
+
+        std::map<int, std::vector<ValueRequest> > requests_to_heart;
+        for (std::map<int, std::vector<MatchProposal> >::const_iterator it = torso_received_matches.begin(); it != torso_received_matches.end(); ++it) {
+            for (size_t k = 0; k < it->second.size(); k++) {
+                const MatchProposal &mp = it->second[k];
+                ValueRequest req;
+                req.torso_home_rank = my_rank_;
+                req.torso_local_id = mp.torso_local_id;
+                req.heart_local_id = mp.heart_local_id;
+                requests_to_heart[mp.heart_home_rank].push_back(req);
+            }
+        }
+
+        recv_peers_.clear();
+        recv_torso_local_ids_per_peer_.clear();
+        self_torso_local_ids_.clear();
+        self_heart_local_ids_.clear();
+        for (std::map<int, std::vector<ValueRequest> >::const_iterator it = requests_to_heart.begin(); it != requests_to_heart.end(); ++it) {
+            if (it->first == my_rank_) {
+                for (size_t k = 0; k < it->second.size(); k++) {
+                    self_torso_local_ids_.push_back(it->second[k].torso_local_id);
+                    self_heart_local_ids_.push_back(it->second[k].heart_local_id);
+                }
+            } else {
+                recv_peers_.push_back(it->first);
+                std::vector<int> tdofs;
+                tdofs.reserve(it->second.size());
+                for (size_t k = 0; k < it->second.size(); k++) {
+                    tdofs.push_back(it->second[k].torso_local_id);
+                }
+                recv_torso_local_ids_per_peer_.push_back(tdofs);
+            }
+        }
+
+        if (my_rank_ == 0) { std::cout << "[XFER] begin request_to_heart" << std::endl; }
+        std::map<int, std::vector<ValueRequest> > heart_received_requests =
+            SparseExchangeViaRootMeta(requests_to_heart, request_type, 8401, "request_to_heart");
+        if (my_rank_ == 0) { std::cout << "[XFER] end   request_to_heart" << std::endl; }
+
+        send_peers_.clear();
+        send_heart_local_ids_per_peer_.clear();
+        for (std::map<int, std::vector<ValueRequest> >::const_iterator it = heart_received_requests.begin(); it != heart_received_requests.end(); ++it) {
+            if (it->first == my_rank_) { continue; }
+            send_peers_.push_back(it->first);
+            std::vector<int> hdofs;
+            hdofs.reserve(it->second.size());
+            for (size_t k = 0; k < it->second.size(); k++) {
+                hdofs.push_back(it->second[k].heart_local_id);
+            }
+            send_heart_local_ids_per_peer_.push_back(hdofs);
+        }
+
+        MPI_Type_free(&point_type);
+        MPI_Type_free(&match_type);
+        MPI_Type_free(&request_type);
+
+        {
+            std::ostringstream oss;
+            oss << "[DBG] final_plan send_peers=" << send_peers_.size()
+                << " recv_peers=" << recv_peers_.size()
+                << " self_pairs=" << self_heart_local_ids_.size();
+            DebugLog(oss.str());
+        }
+    }
+
+public:
+    HeartTorsoBoundaryTransfer(ParMesh* heart_mesh,
+                               ParFiniteElementSpace* heart_fes,
+                               ParGridFunction* heart_gf,
+                               ParMesh* torso_mesh,
+                               ParFiniteElementSpace* torso_fes,
+                               ParGridFunction* torso_gf,
+                               double tol)
+        : heart_mesh_(heart_mesh),
+          heart_fes_(heart_fes),
+          heart_gf_(heart_gf),
+          torso_mesh_(torso_mesh),
+          torso_fes_(torso_fes),
+          torso_gf_(torso_gf),
+          spatial_tol_(tol),
+          my_rank_(0),
+          num_ranks_(1),
+          global_xmin_(0.0),
+          global_xmax_(1.0)
+    {
+        MPI_Comm_rank(MPI_COMM_WORLD, &my_rank_);
+        MPI_Comm_size(MPI_COMM_WORLD, &num_ranks_);
+        BuildInterfaceMap();
+    }
+
+    void TransferValuesToTorsoBoundary()
+    {
+        for (size_t i = 0; i < local_torso_dirichlet_vdofs_.size(); i++) {
+            (*torso_gf_)(local_torso_dirichlet_vdofs_[i]) = DEFAULT_HEART_POTENTIAL;
+        }
+
+        for (size_t i = 0; i < self_heart_local_ids_.size() && i < self_torso_local_ids_.size(); i++) {
+            (*torso_gf_)(self_torso_local_ids_[i]) = (*heart_gf_)(self_heart_local_ids_[i]);
+        }
+
+        std::vector<std::vector<double> > recv_buffers(recv_peers_.size());
+        std::vector<std::vector<double> > send_buffers(send_peers_.size());
+        std::vector<MPI_Request> reqs;
+
+        for (size_t i = 0; i < recv_peers_.size(); i++) {
+            recv_buffers[i].resize(recv_torso_local_ids_per_peer_[i].size(), DEFAULT_HEART_POTENTIAL);
+            if (!recv_buffers[i].empty()) {
+                MPI_Request r;
+                MPI_Irecv(recv_buffers[i].data(), static_cast<int>(recv_buffers[i].size()), MPI_DOUBLE,
+                          recv_peers_[i], 8501, MPI_COMM_WORLD, &r);
+                reqs.push_back(r);
+            }
+        }
+
+        for (size_t i = 0; i < send_peers_.size(); i++) {
+            send_buffers[i].resize(send_heart_local_ids_per_peer_[i].size(), 0.0);
+            for (size_t k = 0; k < send_heart_local_ids_per_peer_[i].size(); k++) {
+                send_buffers[i][k] = (*heart_gf_)(send_heart_local_ids_per_peer_[i][k]);
+            }
+            if (!send_buffers[i].empty()) {
+                MPI_Request r;
+                MPI_Isend(send_buffers[i].data(), static_cast<int>(send_buffers[i].size()), MPI_DOUBLE,
+                          send_peers_[i], 8501, MPI_COMM_WORLD, &r);
+                reqs.push_back(r);
+            }
+        }
+
+        if (!reqs.empty()) {
+            MPI_Waitall(static_cast<int>(reqs.size()), reqs.data(), MPI_STATUSES_IGNORE);
+        }
+
+        for (size_t i = 0; i < recv_buffers.size(); i++) {
+            for (size_t k = 0; k < recv_buffers[i].size() && k < recv_torso_local_ids_per_peer_[i].size(); k++) {
+                (*torso_gf_)(recv_torso_local_ids_per_peer_[i][k]) = recv_buffers[i][k];
+            }
+        }
     }
 };
-
-
 
 // 定义边界条件类型的映射
 enum BoundaryType {
-    NEUMANN_ZERO = 1,   // 零Neumann边界(外部边界)
-    DIRICHLET = 100,    // Dirichlet边界(心脏-躯干界面)
-    SOURCE = 100        // 源边界(与Dirichlet边界相同)
+    NEUMANN_ZERO = 1,
+    DIRICHLET = 100,
+    SOURCE = 100
 };
-
-// 边界点结构
-struct BoundaryPoint {
-    Vector coords;
-    double value;
-    
-    BoundaryPoint(const Vector& c, double v) : coords(c), value(v) {}
-};
-
-// 优化后的CoordinateBasedTransfer类定义
-class CoordinateBasedTransfer {
-private:
-    ParMesh* source_mesh;
-    ParFiniteElementSpace* source_fes;
-    ParGridFunction* source_gf;
-    
-    // 用于空间查找的容忍度
-    const double spatial_tol = 1e-8;
-    
-    // 存储源网格边界点的坐标、索引和值
-    struct BoundaryPoint {
-        Vector coords;
-        int vertex_id;  // 添加顶点ID以便更新
-        double value;
-        
-        BoundaryPoint(const Vector& c, int id, double v) : coords(c), vertex_id(id), value(v) {}
-    };
-    
-    std::vector<BoundaryPoint> boundary_points;
-
-public:
-    CoordinateBasedTransfer(ParMesh* src_mesh, ParFiniteElementSpace* src_fes, 
-                           ParGridFunction* src_gf)
-        : source_mesh(src_mesh), source_fes(src_fes), source_gf(src_gf) {
-        // 构建源网格(心脏)边界点的映射
-        BuildBoundaryPointsMap();
-    }
-
-    // 构建边界点坐标-值映射
-    void BuildBoundaryPointsMap() {
-        // 获取源网格的所有边界顶点
-        for (int i = 0; i < source_mesh->GetNBE(); i++) {
-            Array<int> vertices;
-            source_mesh->GetBdrElementVertices(i, vertices);
-            
-            // 对于每个顶点
-            for (int j = 0; j < vertices.Size(); j++) {
-                int vdof = vertices[j];
-                
-                // 获取顶点坐标
-                Vector coords(3);
-                source_mesh->GetNode(vdof, coords);
-                
-                // 获取该顶点处的值
-                double value = (*source_gf)(vdof);
-                
-                // 存储顶点ID、坐标和值
-                boundary_points.emplace_back(coords, vdof, value);
-            }
-        }
-    }
-    
-    // 新方法：更新边界点的值而不重建映射
-    void UpdateBoundaryValues() {
-        for (auto& bp : boundary_points) {
-            bp.value = (*source_gf)(bp.vertex_id);
-        }
-    }
-
-    // 获取目标点的值
-    double GetValueAtPoint(const Vector& point) {
-        // 查找最近的点
-        double min_dist = std::numeric_limits<double>::max();
-        double closest_value = DEFAULT_HEART_POTENTIAL;
-        
-        for (const auto& bp : boundary_points) {
-            double dist = 0.0;
-            for (int i = 0; i < 3; i++) {
-                dist += (bp.coords(i) - point(i)) * (bp.coords(i) - point(i));
-            }
-            dist = sqrt(dist);
-            
-            if (dist < min_dist) {
-                min_dist = dist;
-                closest_value = bp.value;
-                
-                // 如果距离小于容差，立即返回
-                if (dist < spatial_tol) {
-                    return closest_value;
-                }
-            }
-        }
-        
-        // 返回最近点的值
-        return closest_value;
-    }
-};
-
-
-
-// 修改 BoundaryValuesCoefficient 类，添加对两种传输类的支持
-class BoundaryValuesCoefficient : public Coefficient {
-private:
-    CoordinateBasedTransfer* transfer;
-    ParallelCoordinateBasedTransfer* parallel_transfer;
-    bool use_parallel;
-    
-public:
-    // 原有构造函数
-    BoundaryValuesCoefficient(CoordinateBasedTransfer* t) 
-        : transfer(t), parallel_transfer(nullptr), use_parallel(false) {}
-    
-    // 新增构造函数
-    BoundaryValuesCoefficient(ParallelCoordinateBasedTransfer* t) 
-        : transfer(nullptr), parallel_transfer(t), use_parallel(true) {}
-    
-    virtual double Eval(ElementTransformation& T, const IntegrationPoint& ip) {
-        Vector physical_coord(3);
-        T.Transform(ip, physical_coord);
-        
-        if (use_parallel) {
-            return parallel_transfer->GetValueAtPoint(physical_coord);
-        } else {
-            return transfer->GetValueAtPoint(physical_coord);
-        }
-    }
-};
-
-
-
-
-
 
 // 用于比较两个点坐标是否相等的辅助结构体
 struct Point3D {
@@ -530,6 +850,29 @@ int main(int argc, char *argv[])
    bool use_petsc = true;//false;true
    const char *petscrc_file = "rc_fem_heart";
    MFEMInitializePetsc(NULL,NULL,petscrc_file,NULL);
+
+   // Optional PETSc runtime cap for number of time steps.
+   // -max_time_steps <N>, N >= 0; when unset, run all timeline steps.
+   PetscInt max_time_steps_opt = -1;
+   PetscBool has_max_time_steps_opt = PETSC_FALSE;
+   PetscErrorCode petsc_opt_ierr =
+       PetscOptionsGetInt(NULL, NULL, "-max_time_steps",
+                          &max_time_steps_opt, &has_max_time_steps_opt);
+   if (petsc_opt_ierr)
+   {
+      if (my_rank == 0)
+      {
+         std::cerr << "Warning: failed to parse PETSc option -max_time_steps; "
+                   << "ignoring step cap." << std::endl;
+      }
+      has_max_time_steps_opt = PETSC_FALSE;
+      max_time_steps_opt = -1;
+   }
+   int user_max_time_steps = -1;
+   if (has_max_time_steps_opt && max_time_steps_opt >= 0)
+   {
+      user_max_time_steps = static_cast<int>(max_time_steps_opt);
+   }
 
 
        // --- Timer Variable Declarations ---
@@ -782,7 +1125,18 @@ if (my_rank == 0) {
       }
    }
    
-   Timeline timeline(dt, endTime);   
+   Timeline timeline(dt, endTime);  
+   int max_time_steps = timeline.maxTimesteps();
+   if (user_max_time_steps >= 0)
+   {
+      max_time_steps = std::min(max_time_steps, user_max_time_steps);
+   }
+   if (my_rank == 0 && user_max_time_steps >= 0)
+   {
+      std::cout << "PETSc max_time_steps limit enabled: " << max_time_steps
+                << " (timeline default: " << timeline.maxTimesteps() << ")"
+                << std::endl;
+   }
 
    StartTimer("Setting Attributes");
    pmesh->SetAttributes();
@@ -915,10 +1269,7 @@ for (int i = 0; i < pmesh_torso->GetNBE(); i++) {
 
 
     // 在时间循环之前初始化交界面处理对象 - 添加这段代码
-    //CoordinateBasedTransfer* transfer = nullptr;
-    //BoundaryValuesCoefficient* bdr_coef = nullptr;
-    ParallelCoordinateBasedTransfer* parallel_transfer = nullptr;
-    BoundaryValuesCoefficient* bdr_coef = nullptr;
+    HeartTorsoBoundaryTransfer* interface_transfer = nullptr;
         
     
     if (my_rank == 0) {
@@ -1258,11 +1609,11 @@ if(use_petsc)
             std::cout << "初始化心脏-躯干交界面传输对象..." << std::endl;
         }
         
-        // 创建对象一次，之后只更新值
-        //transfer = new CoordinateBasedTransfer(pmesh, pfespace, &gf_ue);
-        //bdr_coef = new BoundaryValuesCoefficient(transfer);
-            parallel_transfer = new ParallelCoordinateBasedTransfer(pmesh, pfespace, &gf_ue);
-            bdr_coef = new BoundaryValuesCoefficient(parallel_transfer);
+        // 创建一次接口映射，之后每个时间步只传递边界值
+            interface_transfer = new HeartTorsoBoundaryTransfer(
+                pmesh, pfespace, &gf_ue,
+                pmesh_torso, pfespace_torso, gf_ue_torso,
+                tolerance);
         
         if (my_rank == 0) {
             std::cout << "心脏-躯干交界面传输对象初始化完成。" << std::endl;
@@ -1284,7 +1635,8 @@ Vector B_torso, X_torso;
         precond_hypre = new HypreBoomerAMG;
         pcg_hypre = new HyprePCG(MPI_COMM_WORLD);    
         //parcsr_A_hypre = parcsr_A_hypre.As<HypreParMatrix>();
-        a_pblf_torso->FormSystemMatrix(ess_tdof_list_torso, A_torso_hypre);
+        a_pblf_torso->FormLinearSystem(ess_tdof_list_torso, *gf_ue_torso, *b_plf_torso, 
+             A_torso_hypre, X_torso, B_torso);
 
         precond_hypre->SetPrintLevel(0);
         pcg_hypre->SetPreconditioner(*precond_hypre);
@@ -1296,6 +1648,15 @@ Vector B_torso, X_torso;
    else
    {
         pcg_petsc = new PetscPCGSolver(MPI_COMM_WORLD, "torso_", true);
+        pcg_petsc->SetRelTol(1e-4);
+        pcg_petsc->SetAbsTol(1e-10);
+        pcg_petsc->SetMaxIter(3000);
+        pcg_petsc->SetPrintLevel(0);
+
+        b_plf_torso->Assemble();
+        a_pblf_torso->FormLinearSystem(ess_tdof_list_torso, *gf_ue_torso, *b_plf_torso,
+                A_torso_petsc, X_torso, B_torso);
+        pcg_petsc->SetOperator(A_torso_petsc);
    }
 
 
@@ -1328,46 +1689,9 @@ paraview_dc_torso.SetTime(0.0);
    int itime=0;
    while (1)
    {
-      if (my_rank == 0)
-      {
-         std::cout << "time = " << timeline.realTimeFromTimestep(itime) << std::endl;
-      }
-      //output if appropriate
-      if ((itime % timeline.timestepFromRealTime(outputRate)) == 0)
-      {
-         // 添加同步点，确保所有进程在输出前完成计算
-         MPI_Barrier(MPI_COMM_WORLD);
-         std::string timedir = outputDir + "/gf_Data" + "/tm" + timeline.outputIdFromTimestep(itime);
-         if (my_rank == 0)
-         { recursive_mkdir(timedir); }
-
-      {
-         std::string gf_filename = timedir + "/gf_Vm";
-         std::string gf_ue_filename = timedir + "/gf_ue";
-         gf_Vm.SaveAsOne(gf_filename.c_str());
-         gf_ue.SaveAsOne(gf_ue_filename.c_str());
-
-        std::string gf_ue_torso_filename = timedir + "/gf_ue_torso";
-        gf_ue_torso->SaveAsOne(gf_ue_torso_filename.c_str());
-
-
-      }
-
-      paraview_dc.SetCycle(itime);
-      paraview_dc.SetTime(timeline.realTimeFromTimestep(itime));
-      paraview_dc.Save();
-
-      paraview_dc_torso.SetCycle(itime);
-      paraview_dc_torso.SetTime(timeline.realTimeFromTimestep(itime));
-      paraview_dc_torso.Save();
-
-
-         
-         // 添加同步障碍，确保所有进程都完成了数据传输
-         MPI_Barrier(MPI_COMM_WORLD);
-      }
+      // Strong-scaling timing mode: disable all per-step file output and related barriers.
       //if end time, then exit
-      if (itime == timeline.maxTimesteps()) { break; }
+      if (itime == max_time_steps) { break; }
 
 
 t_total_start = MPI_Wtime();
@@ -1433,17 +1757,6 @@ t_ionic_start = MPI_Wtime();
       
       // 求解伪双域模型以恢复细胞外电位u_e
       if (solveForUe) {
-          if (my_rank == 0 && itime % 10 == 0) {
-              std::cout << "求解细胞外电位(u_e)..." << std::endl;
-          }
-          
-          // 设置统一的打印级别
-          int local_print_level = (my_rank == 0 && itime % 50 == 0) ? 3 : 0;
-          int global_print_level;
-          MPI_Allreduce(&local_print_level, &global_print_level, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-          
-
-
 
     gf_Vm.GetTrueDofs(vm_true);
     
@@ -1491,10 +1804,6 @@ t_ionic_start = MPI_Wtime();
         double mean_value = global_sum / global_count;
         
         if (fabs(mean_value) > 1e-6) {
-            if (my_rank == 0) {
-                std::cout << "调整解向量以确保均值为零，当前均值: " << mean_value << std::endl;
-            }
-            
             // 从解中减去平均值
             for (int i = 0; i < X_recoverue.Size(); i++) {
                 X_recoverue(i) -= mean_value;
@@ -1503,13 +1812,7 @@ t_ionic_start = MPI_Wtime();
             // 更新网格函数
             gf_ue.SetFromTrueDofs(X_recoverue);
             
-            if (my_rank == 0) {
-                std::cout << "已从解中减去均值: " << mean_value << std::endl;
-            }
         } else {
-            if (my_rank == 0) {
-                std::cout << "解向量均值已经接近零: " << mean_value << "，无需调整。" << std::endl;
-            }
         }
     }
 
@@ -1518,15 +1821,12 @@ t_ionic_start = MPI_Wtime();
       
 // 在时间迭代循环中，找到求解伪双域模型的部分后面
 if (solve_torso_model  && pmesh_torso && pfespace_torso && gf_ue_torso) {
-   if (my_rank == 0 && itime % 10 == 0) {
-       std::cout << "\n===== 求解Torso模型 =====\n" << std::endl;
-   }
    
 double t_boundary_start_1, t_boundary_end_1, t_boundary_duration_1;
 double t_boundary_start_2, t_boundary_end_2, t_boundary_duration_2;
 t_boundary_start_1 = MPI_Wtime();
 
- parallel_transfer->UpdateBoundaryValues();
+ interface_transfer->TransferValuesToTorsoBoundary();
  t_boundary_end_1 = MPI_Wtime();
 t_boundary_duration_1 = t_boundary_end_1 - t_boundary_start_1;
 
@@ -1534,16 +1834,9 @@ t_boundary_duration_1 = t_boundary_end_1 - t_boundary_start_1;
 
     t_boundary_start_2 = MPI_Wtime();
   // 应用边界条件 - 仅在Dirichlet边界上使用心脏网格的值
-    gf_ue_torso->ProjectBdrCoefficient(*bdr_coef, ess_bdr_torso);
 
  t_boundary_end_2 = MPI_Wtime();
 t_boundary_duration_2 = t_boundary_end_2 - t_boundary_start_2;
-
-if (my_rank == 0) {
-    std::cout << "UpdateBoundaryValues 运行时间: " << t_boundary_duration_1 << " 秒" << std::endl;
-    std::cout << "ProjectBdrCoefficient 运行时间: " << t_boundary_duration_2 << " 秒" << std::endl;
-}
-
 
 
    if (!use_petsc)
@@ -1559,16 +1852,6 @@ if (my_rank == 0) {
    {
       a_pblf_torso->FormLinearSystem(ess_tdof_list_torso, *gf_ue_torso, *b_plf_torso,
                 A_torso_petsc, X_torso, B_torso);
-      //pcg_petsc = new PetscPCGSolver(*A_torso_petsc);
-        
-        pcg_petsc->SetOperator(A_torso_petsc);
-
-              //pcg_petsc->iterative_mode = true; // iterative_mode is true by default with CGSolver
-      pcg_petsc->SetRelTol(1e-4);
-      pcg_petsc->SetAbsTol(1e-10);
-      pcg_petsc->SetMaxIter(3000);
-      pcg_petsc->SetPrintLevel(3); // 提高打印级别
-
       t_ksp3_start = MPI_Wtime();
       pcg_petsc->Mult(B_torso, X_torso);
       t_ksp3_end = MPI_Wtime();
@@ -1588,15 +1871,6 @@ if (my_rank == 0) {
 
  t_total_end = MPI_Wtime();
     t_total += (t_total_end - t_total_start);
-
-
-
-
-
-   
-   if (my_rank == 0 && itime % 10 == 0) {
-       std::cout << "\n===== Torso模型处理完成 =====\n" << std::endl;
-   }
 
 
 }
@@ -1700,8 +1974,7 @@ if (pcg_monodomain_petsc) delete pcg_monodomain_petsc;
     //if (torso_mesh) delete torso_mesh;
     // 主函数末尾资源清理部分应该还需要添加：
 //if (transfer) delete transfer;
-if (parallel_transfer) delete parallel_transfer;
-if (bdr_coef) delete bdr_coef;
+if (interface_transfer) delete interface_transfer;
 
 
 if (a_pblf_torso) delete a_pblf_torso;
