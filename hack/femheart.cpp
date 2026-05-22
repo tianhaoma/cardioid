@@ -20,12 +20,16 @@
 #include "MatrixElementPiecewiseCoefficient.hpp"
 #include "cardiac_coefficients.hpp"
 #include "torsoSolver.hpp"
+#include "pod_coarse_space.hpp"
+#include "two_level_asm.hpp"
 
 #include <map>
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
+#include <vector>
 
 #include <mpi.h> // Include MPI header
 #include <iomanip> // For formatted output
@@ -41,6 +45,98 @@ MPI_Comm COMM_LOCAL = MPI_COMM_WORLD;
 
 
 const double DEFAULT_HEART_POTENTIAL = -83.0;  // 默认心脏电位值（仅作为备用）
+
+static void ConvertHypreToPetscAIJSafe(HypreParMatrix &hypre_mat,
+                                       PetscParMatrix &petsc_mat,
+                                       const char *name,
+                                       int my_rank)
+{
+    MPI_Comm comm = hypre_mat.GetComm();
+    const HYPRE_BigInt row_start_big = hypre_mat.GetRowStarts()[0];
+    const HYPRE_BigInt row_end_big = hypre_mat.GetRowStarts()[1];
+    const HYPRE_BigInt col_start_big = hypre_mat.GetColStarts()[0];
+    const HYPRE_BigInt col_end_big = hypre_mat.GetColStarts()[1];
+
+    const PetscInt local_rows =
+        static_cast<PetscInt>(row_end_big - row_start_big);
+    const PetscInt local_cols =
+        static_cast<PetscInt>(col_end_big - col_start_big);
+    const PetscInt global_rows =
+        static_cast<PetscInt>(hypre_mat.GetGlobalNumRows());
+    const PetscInt global_cols =
+        static_cast<PetscInt>(hypre_mat.GetGlobalNumCols());
+    const PetscInt col_start = static_cast<PetscInt>(col_start_big);
+    const PetscInt col_end = static_cast<PetscInt>(col_end_big);
+
+    SparseMatrix merged;
+    hypre_mat.MergeDiagAndOffd(merged);
+    MFEM_VERIFY(merged.Height() == local_rows,
+                "Unexpected local row count in Hypre to PETSc conversion.");
+
+    const int *I = merged.HostReadI();
+    const int *J = merged.HostReadJ();
+    const real_t *data = merged.HostReadData();
+
+    std::vector<PetscInt> d_nnz(static_cast<size_t>(local_rows), 0);
+    std::vector<PetscInt> o_nnz(static_cast<size_t>(local_rows), 0);
+    for (PetscInt i = 0; i < local_rows; ++i)
+    {
+        for (int p = I[i]; p < I[i + 1]; ++p)
+        {
+            const PetscInt col = static_cast<PetscInt>(J[p]);
+            if (col_start <= col && col < col_end)
+            {
+                ++d_nnz[static_cast<size_t>(i)];
+            }
+            else
+            {
+                ++o_nnz[static_cast<size_t>(i)];
+            }
+        }
+    }
+
+    Mat mat = NULL;
+    PetscErrorCode ierr = MatCreateAIJ(
+        comm, local_rows, local_cols, global_rows, global_cols,
+        0, local_rows ? d_nnz.data() : NULL,
+        0, local_rows ? o_nnz.data() : NULL, &mat);
+    MFEM_VERIFY(ierr == 0, "MatCreateAIJ failed in safe Hypre conversion.");
+
+    if (name)
+    {
+        ierr = PetscObjectSetName((PetscObject) mat, name);
+        MFEM_VERIFY(ierr == 0, "PetscObjectSetName failed in safe Hypre conversion.");
+    }
+
+    for (PetscInt i = 0; i < local_rows; ++i)
+    {
+        const PetscInt row = static_cast<PetscInt>(row_start_big) + i;
+        for (int p = I[i]; p < I[i + 1]; ++p)
+        {
+            const PetscInt col = static_cast<PetscInt>(J[p]);
+            const PetscScalar value = static_cast<PetscScalar>(data[p]);
+            ierr = MatSetValues(mat, 1, &row, 1, &col, &value, INSERT_VALUES);
+            MFEM_VERIFY(ierr == 0,
+                        "MatSetValues failed in safe Hypre conversion.");
+        }
+    }
+
+    ierr = MatAssemblyBegin(mat, MAT_FINAL_ASSEMBLY);
+    MFEM_VERIFY(ierr == 0, "MatAssemblyBegin failed in safe Hypre conversion.");
+    ierr = MatAssemblyEnd(mat, MAT_FINAL_ASSEMBLY);
+    MFEM_VERIFY(ierr == 0, "MatAssemblyEnd failed in safe Hypre conversion.");
+
+    petsc_mat.SetMat(mat);
+    ierr = MatDestroy(&mat);
+    MFEM_VERIFY(ierr == 0, "MatDestroy failed after safe Hypre conversion.");
+
+    if (my_rank == 0)
+    {
+        std::cout << "[PETSc] safe AIJ conversion for " << name
+                  << ": global " << global_rows << "x" << global_cols
+                  << ", local rows on rank 0 = " << local_rows << std::endl;
+    }
+}
 
 
 
@@ -874,6 +970,13 @@ int main(int argc, char *argv[])
       user_max_time_steps = static_cast<int>(max_time_steps_opt);
    }
 
+   PetscInt mesh_refine_levels_opt = 0;
+   PetscOptionsGetInt(NULL, NULL, "-mesh_refine_levels",
+                      &mesh_refine_levels_opt, NULL);
+   const int mesh_refine_levels =
+      std::max(0, static_cast<int>(mesh_refine_levels_opt));
+
+{
 
        // --- Timer Variable Declarations ---
     double t_start, t_end; // Temporary start/end times
@@ -952,12 +1055,14 @@ visit_dc.SetPrefixPath(data_path);
     pmesh = dynamic_cast<ParMesh*>(visit_dc.GetMesh());
 
     int ne_before_ = pmesh->GetNE();
-//pmesh->UniformRefinement();
-//pmesh->UniformRefinement();
-//pmesh->UniformRefinement();
+for (int ilev = 0; ilev < mesh_refine_levels; ++ilev)
+{
+    pmesh->UniformRefinement();
+}
 int ne_after_ = pmesh->GetNE();
 
 if (my_rank == 0) {
+    cout << "mesh_refine_levels: " << mesh_refine_levels << endl;
     cout << "heart细化前单元数: " << ne_before_ << endl;
     cout << "heart细化后单元数: " << ne_after_ << endl;
     cout << "增长倍数: " << (double)ne_after_/ne_before_ << endl;
@@ -980,9 +1085,10 @@ if (my_rank == 0) {
     
     // 验证细化前后的单元数量
 int ne_before = pmesh_torso->GetNE();
-//pmesh_torso->UniformRefinement();
-//pmesh_torso->UniformRefinement();
-//pmesh_torso->UniformRefinement();
+for (int ilev = 0; ilev < mesh_refine_levels; ++ilev)
+{
+    pmesh_torso->UniformRefinement();
+}
 int ne_after = pmesh_torso->GetNE();
 
 if (my_rank == 0) {
@@ -1136,6 +1242,71 @@ if (my_rank == 0) {
       std::cout << "PETSc max_time_steps limit enabled: " << max_time_steps
                 << " (timeline default: " << timeline.maxTimesteps() << ")"
                 << std::endl;
+   }
+
+   PetscBool pod_enable_opt = PETSC_FALSE;
+   PetscBool pod_opt_set = PETSC_FALSE;
+   PetscOptionsGetBool(NULL, NULL, "-recoverue_pod_enable",
+                       &pod_enable_opt, &pod_opt_set);
+   bool recoverue_pod_enable = (pod_enable_opt == PETSC_TRUE);
+   if (!use_petsc || !solveForUe)
+   {
+      recoverue_pod_enable = false;
+   }
+
+   PetscInt pod_warmup_steps = std::max(0, static_cast<int>(10.0 / dt));
+   PetscOptionsGetInt(NULL, NULL, "-recoverue_pod_warmup_steps",
+                      &pod_warmup_steps, NULL);
+   pod_warmup_steps = std::max<PetscInt>(0, pod_warmup_steps);
+
+   const int default_snapshots =
+      std::max(2, std::min(100, max_time_steps - static_cast<int>(pod_warmup_steps) - 1));
+   PetscInt pod_snapshot_count = default_snapshots;
+   PetscOptionsGetInt(NULL, NULL, "-recoverue_pod_snapshot_count",
+                      &pod_snapshot_count, NULL);
+   pod_snapshot_count = std::max<PetscInt>(2, pod_snapshot_count);
+
+   PetscInt pod_max_basis = 30;
+   PetscOptionsGetInt(NULL, NULL, "-recoverue_pod_max_basis",
+                      &pod_max_basis, NULL);
+   pod_max_basis = std::max<PetscInt>(1, pod_max_basis);
+
+   PetscInt pod_min_basis = 1;
+   PetscOptionsGetInt(NULL, NULL, "-recoverue_pod_min_basis",
+                      &pod_min_basis, NULL);
+   pod_min_basis = std::max<PetscInt>(1, std::min(pod_min_basis, pod_max_basis));
+
+   PetscInt pod_snapshot_stride = 1;
+   PetscOptionsGetInt(NULL, NULL, "-recoverue_pod_snapshot_stride",
+                      &pod_snapshot_stride, NULL);
+   pod_snapshot_stride = std::max<PetscInt>(1, pod_snapshot_stride);
+
+   PetscReal pod_energy_tol = 1.0 - 1e-6;
+   PetscOptionsGetReal(NULL, NULL, "-recoverue_pod_energy_tol",
+                       &pod_energy_tol, NULL);
+   pod_energy_tol = std::min<PetscReal>(1.0, std::max<PetscReal>(0.0, pod_energy_tol));
+
+   PetscReal pod_orth_tol = 1e-8;
+   PetscOptionsGetReal(NULL, NULL, "-recoverue_pod_orth_tol",
+                       &pod_orth_tol, NULL);
+
+   PetscInt pod_asm_overlap = 2;
+   PetscOptionsGetInt(NULL, NULL, "-recoverue_pod_asm_overlap",
+                      &pod_asm_overlap, NULL);
+   pod_asm_overlap = std::max<PetscInt>(0, pod_asm_overlap);
+
+   PetscInt pod_icc_levels = 2;
+   PetscOptionsGetInt(NULL, NULL, "-recoverue_pod_sub_pc_factor_levels",
+                      &pod_icc_levels, NULL);
+   pod_icc_levels = std::max<PetscInt>(0, pod_icc_levels);
+
+   if (my_rank == 0 && recoverue_pod_enable)
+   {
+      std::cout << "[POD] recoverue two-level ASM enabled: snapshots = "
+                << pod_snapshot_count << ", stride = " << pod_snapshot_stride
+                << ", warmup steps = " << pod_warmup_steps
+                << ", k in [" << pod_min_basis << ", " << pod_max_basis << "]"
+                << ", energy tol = " << pod_energy_tol << std::endl;
    }
 
    StartTimer("Setting Attributes");
@@ -1346,6 +1517,13 @@ for (int i = 0; i < pmesh_torso->GetNBE(); i++) {
          }
       }
    }
+   auto DebugMatrixStage = [&](const char *msg)
+   {
+      if (my_rank == 0)
+      {
+         std::cout << "[DBG matrix] " << msg << std::endl;
+      }
+   };
 
    StartTimer("Forming bilinear system (RHS)");
 
@@ -1357,17 +1535,15 @@ for (int i = 0; i < pmesh_torso->GetNBE(); i++) {
    b->Assemble();
    // This creates the linear algebra problem.
    HypreParMatrix RHS_mat;
+   DebugMatrixStage("RHS FormSystemMatrix begin");
    b->FormSystemMatrix(ess_tdof_list, RHS_mat);
+   DebugMatrixStage("RHS FormSystemMatrix done");
    EndTimer();
 
    StartTimer("Forming bilinear system (LHS)");
    
    // Brought out of loop to avoid unnecessary duplication
    ParBilinearForm *a = new ParBilinearForm(pfespace);   // defines a.
-if(use_petsc)//use petsc
-{
-   a->SetOperatorType(Operator::PETSC_MATAIJ);
-}
    a->AddDomainIntegrator(new DiffusionIntegrator(sigma_m_pos_coeffs));
    a->AddDomainIntegrator(new MassIntegrator(one));
    a->Update(pfespace);
@@ -1378,7 +1554,7 @@ if(use_petsc)//use petsc
    HypreSolver *M_test = nullptr;
 
    PetscPCGSolver* pcg_monodomain_petsc = nullptr;
-   PetscParMatrix LHS_monodomain_petsc;
+   PetscParMatrix *LHS_monodomain_petsc = new PetscParMatrix;
 if(!use_petsc)//use petsc
 {
    a->FormSystemMatrix(ess_tdof_list,LHS_mat);
@@ -1391,9 +1567,17 @@ if(!use_petsc)//use petsc
 }
 else
 {
-    a->FormSystemMatrix(ess_tdof_list, LHS_monodomain_petsc);
+    DebugMatrixStage("monodomain Hypre FormSystemMatrix begin");
+    a->FormSystemMatrix(ess_tdof_list, LHS_mat);
+    DebugMatrixStage("monodomain Hypre FormSystemMatrix done");
+    DebugMatrixStage("monodomain safe PETSc conversion begin");
+    ConvertHypreToPetscAIJSafe(LHS_mat, *LHS_monodomain_petsc,
+                               "monodomain_LHS", my_rank);
+    DebugMatrixStage("monodomain safe PETSc conversion done");
     pcg_monodomain_petsc = new PetscPCGSolver(MPI_COMM_WORLD);
-   pcg_monodomain_petsc->SetOperator(LHS_monodomain_petsc);
+   DebugMatrixStage("monodomain PETSc SetOperator begin");
+   pcg_monodomain_petsc->SetOperator(*LHS_monodomain_petsc);
+   DebugMatrixStage("monodomain PETSc SetOperator done");
    pcg_monodomain_petsc->SetRelTol(1e-6);
    //pcg_monodomain_petsc->SetAbsTol(1e-12);
    pcg_monodomain_petsc->SetMaxIter(1000);
@@ -1467,7 +1651,9 @@ else
       Iion_blf->AddDomainIntegrator(new MassIntegrator(dt_coeff));
       Iion_blf->Update(pfespace);
       Iion_blf->Assemble();
+      DebugMatrixStage("Iion FormSystemMatrix begin");
       Iion_blf->FormSystemMatrix(ess_tdof_list,Iion_mat);
+      DebugMatrixStage("Iion FormSystemMatrix done");
    } else {
       Iion_blf = NULL;
       
@@ -1509,20 +1695,12 @@ for (int ii = 0; ii < heartRegions.size(); ii++) {
 
 // 设置左侧矩阵: -∇·((σ_i + σ_e)∇u_e)
 ParBilinearForm *a_pblf_recoverue = new ParBilinearForm(pfespace);
-if(use_petsc)
-{
-    a_pblf_recoverue->SetOperatorType(Operator::PETSC_MATAIJ);
-}
 a_pblf_recoverue->AddDomainIntegrator(new DiffusionIntegrator(sigma_sum));
 a_pblf_recoverue->Assemble(use_petsc ? 0 : 1);  // 注意这里的参数，与torso一致
 a_pblf_recoverue->Finalize();
 
 // 设置右侧向量的临时双线性形式: ∇·(σ_i∇V_m)
 ParBilinearForm* temp_form = new ParBilinearForm(pfespace);  // 改为指针，与torso风格一致
-if(use_petsc)
-{
-    temp_form->SetOperatorType(Operator::PETSC_MATAIJ);
-}
 temp_form->AddDomainIntegrator(new DiffusionIntegrator(sigma_i));
 temp_form->Assemble(use_petsc ? 0 : 1);
 temp_form->Finalize();
@@ -1533,11 +1711,11 @@ HyprePCG* pcg_recoverue_hypre = nullptr;
 HypreParMatrix A_recoverue_hypre;  // 栈对象，与torso一致
 
 PetscPCGSolver* pcg_recoverue_petsc = nullptr;
-PetscParMatrix A_recoverue_petsc;  // 栈对象，与torso一致
+PetscParMatrix *A_recoverue_petsc = new PetscParMatrix;
 
 // 临时矩阵也用相同风格
 HypreParMatrix A_temp_hypre;
-PetscParMatrix A_temp_petsc;
+PetscParMatrix *A_temp_petsc = new PetscParMatrix;
 
 Vector B_recoverue, X_recoverue;
 Vector vm_true(pfespace->GetTrueVSize());
@@ -1563,16 +1741,95 @@ if (!use_petsc)
 else
 {
     // 形成系统矩阵（PETSc版本）
-    a_pblf_recoverue->FormSystemMatrix(ess_tdof_list, A_recoverue_petsc);
-    temp_form->FormSystemMatrix(ess_tdof_list, A_temp_petsc);
+    DebugMatrixStage("recoverue A2 Hypre FormSystemMatrix begin");
+    a_pblf_recoverue->FormSystemMatrix(ess_tdof_list, A_recoverue_hypre);
+    DebugMatrixStage("recoverue A2 Hypre FormSystemMatrix done");
+    DebugMatrixStage("recoverue A2 safe PETSc conversion begin");
+    ConvertHypreToPetscAIJSafe(A_recoverue_hypre, *A_recoverue_petsc,
+                               "recoverue_A2", my_rank);
+    DebugMatrixStage("recoverue A2 safe PETSc conversion done");
+    DebugMatrixStage("recoverue temp Hypre FormSystemMatrix begin");
+    temp_form->FormSystemMatrix(ess_tdof_list, A_temp_hypre);
+    DebugMatrixStage("recoverue temp Hypre FormSystemMatrix done");
+    DebugMatrixStage("recoverue temp safe PETSc conversion begin");
+    ConvertHypreToPetscAIJSafe(A_temp_hypre, *A_temp_petsc,
+                               "recoverue_temp", my_rank);
+    DebugMatrixStage("recoverue temp safe PETSc conversion done");
+
+    if (ess_tdof_list.Size() == 0)
+    {
+        DebugMatrixStage("recoverue MatNullSpace attach begin");
+        MatNullSpace nsp = NULL;
+        PetscErrorCode ierr = MatNullSpaceCreate(MPI_COMM_WORLD, PETSC_TRUE,
+                                                 0, NULL, &nsp);
+        MFEM_VERIFY(ierr == 0, "MatNullSpaceCreate failed for recoverue A2.");
+        Mat A2_petsc = *A_recoverue_petsc;
+        ierr = MatSetNullSpace(A2_petsc, nsp);
+        MFEM_VERIFY(ierr == 0, "MatSetNullSpace failed for recoverue A2.");
+        ierr = MatSetTransposeNullSpace(A2_petsc, nsp);
+        MFEM_VERIFY(ierr == 0, "MatSetTransposeNullSpace failed for recoverue A2.");
+        ierr = MatNullSpaceDestroy(&nsp);
+        MFEM_VERIFY(ierr == 0, "MatNullSpaceDestroy failed for recoverue A2.");
+        if (my_rank == 0)
+        {
+            std::cout << "[POD] MatSetNullSpace(span{1}) attached to A2."
+                      << std::endl;
+        }
+        DebugMatrixStage("recoverue MatNullSpace attach done");
+    }
     
     pcg_recoverue_petsc = new PetscPCGSolver(MPI_COMM_WORLD, "recoverue_", true);
     // 如果PetscPCGSolver需要SetOperator，添加：
-    pcg_recoverue_petsc->SetOperator(A_recoverue_petsc);
+    DebugMatrixStage("recoverue PETSc SetOperator begin");
+    pcg_recoverue_petsc->SetOperator(*A_recoverue_petsc);
+    DebugMatrixStage("recoverue PETSc SetOperator done");
 }
 
 X_recoverue.SetSize(pfespace->GetTrueVSize());
 X_recoverue = 0.0;  // 初始猜测为零
+
+ParBilinearForm m_form_recoverue(pfespace);
+m_form_recoverue.AddDomainIntegrator(new MassIntegrator(one));
+m_form_recoverue.Assemble();
+m_form_recoverue.Finalize();
+HypreParMatrix M_recoverue;
+{
+    Array<int> empty_ess;
+    m_form_recoverue.FormSystemMatrix(empty_ess, M_recoverue);
+}
+
+Vector ones_true_recoverue(pfespace->GetTrueVSize());
+ones_true_recoverue = 1.0;
+Vector M_ones_recoverue(pfespace->GetTrueVSize());
+M_recoverue.Mult(ones_true_recoverue, M_ones_recoverue);
+double M_total_recoverue =
+    InnerProduct(MPI_COMM_WORLD, ones_true_recoverue, M_ones_recoverue);
+MFEM_VERIFY(M_total_recoverue > 0.0, "Recoverue mass matrix has zero total mass.");
+
+std::vector<Vector> U_recoverue_snapshots;
+if (recoverue_pod_enable)
+{
+    U_recoverue_snapshots.reserve(static_cast<size_t>(pod_snapshot_count));
+}
+bool recoverue_pod_ready = false;
+PODCoarseSpace* recoverue_pod = nullptr;
+int total_iterations_recoverue_pre_pod = 0;
+int solve_count_recoverue_pre_pod = 0;
+int total_iterations_recoverue_pod_online = 0;
+int solve_count_recoverue_pod_online = 0;
+
+if (my_rank == 0)
+{
+    std::cout << "[POD] recoverue mass gauge ready, 1^T M 1 = "
+              << std::scientific << M_total_recoverue << std::defaultfloat
+              << std::endl;
+    if (recoverue_pod_enable &&
+        static_cast<int>(pod_warmup_steps + pod_snapshot_stride * (pod_snapshot_count - 1)) >= max_time_steps - 1)
+    {
+        std::cout << "[POD] warning: current snapshot schedule may leave few or no "
+                  << "online steps before max_time_steps." << std::endl;
+    }
+}
 
 
 
@@ -1580,10 +1837,6 @@ X_recoverue = 0.0;  // 初始猜测为零
 
         // 5. 创建双线性型和线性型
         ParBilinearForm* a_pblf_torso = new ParBilinearForm(pfespace_torso);
-if(use_petsc)
-{
-   a_pblf_torso->SetOperatorType(Operator::PETSC_MATAIJ);
-}
 
         ConstantCoefficient sigma_torso_coeff(sigma_torso);
         a_pblf_torso->AddDomainIntegrator(new DiffusionIntegrator(sigma_torso_coeff));
@@ -1626,7 +1879,7 @@ HyprePCG* pcg_hypre = nullptr;
 HypreParMatrix A_torso_hypre;
 
 PetscPCGSolver* pcg_petsc = nullptr;
-PetscParMatrix A_torso_petsc;
+PetscParMatrix *A_torso_petsc = new PetscParMatrix;
 
 Vector B_torso, X_torso;
 
@@ -1655,8 +1908,10 @@ Vector B_torso, X_torso;
 
         b_plf_torso->Assemble();
         a_pblf_torso->FormLinearSystem(ess_tdof_list_torso, *gf_ue_torso, *b_plf_torso,
-                A_torso_petsc, X_torso, B_torso);
-        pcg_petsc->SetOperator(A_torso_petsc);
+                A_torso_hypre, X_torso, B_torso);
+        ConvertHypreToPetscAIJSafe(A_torso_hypre, *A_torso_petsc,
+                                   "torso_A", my_rank);
+        pcg_petsc->SetOperator(*A_torso_petsc);
    }
 
 
@@ -1721,7 +1976,7 @@ t_ionic_start = MPI_Wtime();
     }
     else
     {
-        a->FormLinearSystem(ess_tdof_list, gf_Vm, *c, LHS_monodomain_petsc, actual_Vm, actual_b, 1);
+        a->FormLinearSystem(ess_tdof_list, gf_Vm, *c, LHS_mat, actual_Vm, actual_b, 1);
     }
 
 
@@ -1764,11 +2019,12 @@ t_ionic_start = MPI_Wtime();
     if (!use_petsc) {
         A_temp_hypre.Mult(-1.0, vm_true, 0.0, rhs_recoverue);
     } else {
-        A_temp_petsc.Mult(-1.0, vm_true, 0.0, rhs_recoverue);
+        A_temp_petsc->Mult(-1.0, vm_true, 0.0, rhs_recoverue);
     }
     
     // 记录求解时间
     t_ksp2_start = MPI_Wtime();
+    const bool recoverue_solve_used_pod = recoverue_pod_ready;
     
     // 求解线性系统
     if (!use_petsc) {
@@ -1776,43 +2032,99 @@ t_ionic_start = MPI_Wtime();
     } else {
         pcg_recoverue_petsc->Mult(rhs_recoverue, X_recoverue);
         int current_iterations = pcg_recoverue_petsc->GetNumIterations();
-    total_iterations_recoverue += current_iterations;
-    solve_count_recoverue++;
+        total_iterations_recoverue += current_iterations;
+        solve_count_recoverue++;
+        if (recoverue_solve_used_pod)
+        {
+            total_iterations_recoverue_pod_online += current_iterations;
+            solve_count_recoverue_pod_online++;
+        }
+        else
+        {
+            total_iterations_recoverue_pre_pod += current_iterations;
+            solve_count_recoverue_pre_pod++;
+        }
+        if (my_rank == 0 && recoverue_pod_enable)
+        {
+            std::cout << "[POD] recoverue step " << itime
+                      << " iterations = " << current_iterations
+                      << (recoverue_solve_used_pod ? " (two-level)" : " (ASM)")
+                      << std::endl;
+        }
     
     }
     
     t_ksp2_end = MPI_Wtime();
     t_ksp2_total += (t_ksp2_end - t_ksp2_start);
     
-    // 更新网格函数
+    if (ess_tdof_list.Size() == 0)
+    {
+        Vector Mu(X_recoverue.Size());
+        M_recoverue.Mult(X_recoverue, Mu);
+        const double gauge_before =
+            InnerProduct(MPI_COMM_WORLD, ones_true_recoverue, Mu);
+        X_recoverue.Add(-gauge_before / M_total_recoverue, ones_true_recoverue);
+
+        if (recoverue_pod_enable)
+        {
+            M_recoverue.Mult(X_recoverue, Mu);
+            const double gauge_after =
+                InnerProduct(MPI_COMM_WORLD, ones_true_recoverue, Mu);
+            if (my_rank == 0)
+            {
+                std::cout << "[POD] recoverue mass gauge step " << itime
+                          << ": before = " << std::scientific << gauge_before
+                          << ", after = " << gauge_after << std::defaultfloat
+                          << std::endl;
+            }
+        }
+    }
     gf_ue.SetFromTrueDofs(X_recoverue);
 
-    // 如果需要，强制解的均值为零
-    if (ess_tdof_list.Size() == 0) {//enforce zero mean
-        double local_sum = 0.0;
-        for (int i = 0; i < X_recoverue.Size(); i++) {
-            local_sum += X_recoverue(i);
+    if (recoverue_pod_enable &&
+        !recoverue_pod_ready &&
+        use_petsc &&
+        itime >= pod_warmup_steps &&
+        ((itime - static_cast<int>(pod_warmup_steps)) %
+         static_cast<int>(pod_snapshot_stride) == 0) &&
+        static_cast<int>(U_recoverue_snapshots.size()) < pod_snapshot_count)
+    {
+        Vector snap(X_recoverue.Size());
+        snap = X_recoverue;
+        U_recoverue_snapshots.push_back(std::move(snap));
+
+        if (my_rank == 0)
+        {
+            std::cout << "[POD] collected " << U_recoverue_snapshots.size()
+                      << " / " << pod_snapshot_count
+                      << " recoverue snapshots." << std::endl;
         }
-        
-        double global_sum = 0.0;
-        MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        
-        double global_count = 0.0;
-        local_sum = X_recoverue.Size();
-        MPI_Allreduce(&local_sum, &global_count, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        
-        double mean_value = global_sum / global_count;
-        
-        if (fabs(mean_value) > 1e-6) {
-            // 从解中减去平均值
-            for (int i = 0; i < X_recoverue.Size(); i++) {
-                X_recoverue(i) -= mean_value;
+
+        if (static_cast<int>(U_recoverue_snapshots.size()) == pod_snapshot_count)
+        {
+            recoverue_pod = new PODCoarseSpace(pfespace, A_recoverue_petsc,
+                                               M_recoverue, ones_true_recoverue,
+                                               M_total_recoverue, MPI_COMM_WORLD);
+            recoverue_pod->BuildBasis(U_recoverue_snapshots,
+                                      static_cast<int>(pod_max_basis),
+                                      static_cast<double>(pod_energy_tol),
+                                      static_cast<int>(pod_min_basis));
+
+            AttachTwoLevelASM(pcg_recoverue_petsc, recoverue_pod, pfespace,
+                              MPI_COMM_WORLD,
+                              static_cast<int>(pod_asm_overlap),
+                              static_cast<int>(pod_icc_levels));
+
+            recoverue_pod_ready = true;
+            U_recoverue_snapshots.clear();
+            U_recoverue_snapshots.shrink_to_fit();
+
+            if (my_rank == 0)
+            {
+                std::cout << "[POD] basis ready, k = " << recoverue_pod->Rank()
+                          << ", switched recoverue to two-level ASM."
+                          << std::endl;
             }
-            
-            // 更新网格函数
-            gf_ue.SetFromTrueDofs(X_recoverue);
-            
-        } else {
         }
     }
 
@@ -1851,7 +2163,7 @@ t_boundary_duration_2 = t_boundary_end_2 - t_boundary_start_2;
    else
    {
       a_pblf_torso->FormLinearSystem(ess_tdof_list_torso, *gf_ue_torso, *b_plf_torso,
-                A_torso_petsc, X_torso, B_torso);
+                A_torso_hypre, X_torso, B_torso);
       t_ksp3_start = MPI_Wtime();
       pcg_petsc->Mult(B_torso, X_torso);
       t_ksp3_end = MPI_Wtime();
@@ -1905,6 +2217,34 @@ t_boundary_duration_2 = t_boundary_end_2 - t_boundary_start_2;
         std::cout << "monodomain 平均迭代次数: " << (double)total_iterations_monodomain / solve_count_monodomain << std::endl;
         std::cout << "re ue 平均迭代次数: " << (double)total_iterations_recoverue / solve_count_recoverue << std::endl;
         std::cout << "torso 平均迭代次数: " << (double)total_iterations_torso / solve_count_torso << std::endl;
+        if (recoverue_pod_enable)
+        {
+            std::cout << "\n--- POD Two-Level ASM Statistics ---" << std::endl;
+            std::cout << "Snapshots requested: " << pod_snapshot_count << std::endl;
+            std::cout << "Snapshots remaining in memory: "
+                      << U_recoverue_snapshots.size() << std::endl;
+            std::cout << "POD ready: " << (recoverue_pod_ready ? "yes" : "no")
+                      << std::endl;
+            if (recoverue_pod_ready && recoverue_pod)
+            {
+                std::cout << "Coarse-space rank k: "
+                          << recoverue_pod->Rank() << std::endl;
+            }
+            if (solve_count_recoverue_pre_pod > 0)
+            {
+                std::cout << "Sys2 avg iterations before POD: "
+                          << (double)total_iterations_recoverue_pre_pod /
+                                solve_count_recoverue_pre_pod
+                          << std::endl;
+            }
+            if (solve_count_recoverue_pod_online > 0)
+            {
+                std::cout << "Sys2 avg iterations with POD two-level ASM: "
+                          << (double)total_iterations_recoverue_pod_online /
+                                solve_count_recoverue_pod_online
+                          << std::endl;
+            }
+        }
     }
 
 
@@ -1954,23 +2294,37 @@ t_boundary_duration_2 = t_boundary_end_2 - t_boundary_start_2;
    // 14. Free the used memory.
    delete M_test;
    delete pcg;
+   if (pcg_recoverue_petsc) { delete pcg_recoverue_petsc; pcg_recoverue_petsc = nullptr; }
+if (pcg_monodomain_petsc) { delete pcg_monodomain_petsc; pcg_monodomain_petsc = nullptr; }
+delete pcg_petsc;
+pcg_petsc = nullptr;
+   if (pcg_recoverue_hypre) { delete pcg_recoverue_hypre; pcg_recoverue_hypre = nullptr; }
+   if (precond_recoverue_hypre) { delete precond_recoverue_hypre; precond_recoverue_hypre = nullptr; }
+   if (recoverue_pod) { delete recoverue_pod; recoverue_pod = nullptr; }
+delete LHS_monodomain_petsc;
+LHS_monodomain_petsc = nullptr;
+delete A_recoverue_petsc;
+A_recoverue_petsc = nullptr;
+delete A_temp_petsc;
+A_temp_petsc = nullptr;
+delete A_torso_petsc;
+A_torso_petsc = nullptr;
    delete a;
    delete b;
    delete c;
    if (rf) delete rf;
    if (Iion_blf) delete Iion_blf;
+   if (a_pblf_recoverue) { delete a_pblf_recoverue; a_pblf_recoverue = nullptr; }
+   if (temp_form) { delete temp_form; temp_form = nullptr; }
    delete pfespace;
    //delete fespace;
 delete torso_fec;
-if (pcg_monodomain_petsc) delete pcg_monodomain_petsc;
    if (order > 0) { delete fec; }
    //delete mesh;
-   delete pmesh;
    //delete[] pmeshpart;
 
    if (gf_ue_torso) delete gf_ue_torso;
     if (pfespace_torso) delete pfespace_torso;
-    if (pmesh_torso) delete pmesh_torso;
     //if (torso_mesh) delete torso_mesh;
     // 主函数末尾资源清理部分应该还需要添加：
 //if (transfer) delete transfer;
@@ -1981,10 +2335,10 @@ if (a_pblf_torso) delete a_pblf_torso;
 if (b_plf_torso) delete b_plf_torso;
 delete pcg_hypre;
 delete precond_hypre;
-delete pcg_petsc;
 
 delete pfespace_vec;
 
+}
 
 MFEMFinalizePetsc();
 MPI_Finalize();
